@@ -54,10 +54,10 @@ jobs:
         run: |
           package_path="$(find dist-openclash -maxdepth 1 -name '*.ipk' -print -quit)"
           test -n "$package_path"
-          test "$(ar t "$package_path" | tr '\n' ' ')" = "debian-binary control.tar.gz data.tar.gz "
+          test "$(tar -tzf "$package_path" | tr '\n' ' ')" = "debian-binary data.tar.gz control.tar.gz "
           verify_dir="$(mktemp -d)"
+          tar -xzf "$package_path" -C "$verify_dir"
           cd "$verify_dir"
-          ar x "$GITHUB_WORKSPACE/$package_path"
           test "$(cat debian-binary)" = "2.0"
           tar -tzf control.tar.gz | grep -q './control'
           tar -tzf data.tar.gz | grep -q './usr/lib/lua/luci/controller/proxy_view.lua'

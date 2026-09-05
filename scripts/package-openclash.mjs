@@ -26,6 +26,9 @@ const textExtensions = new Set(['.html', '.js', '.json', '.rsc', '.txt', '.xml']
 const tarOwnerArgs = process.platform === 'darwin'
   ? ['--uid', '0', '--gid', '0']
   : ['--owner=0', '--group=0', '--numeric-owner'];
+const tarFormatArgs = process.platform === 'darwin'
+  ? ['--format=gnutar']
+  : ['--format=gnu'];
 
 if (!existsSync(join(clientRoot, 'index.html'))) {
   console.error('没有找到前端构建产物。请先运行：npm run build');
@@ -105,13 +108,22 @@ exit 0
 `, { mode: 0o755 });
   writeFileSync(join(workRoot, 'debian-binary'), '2.0\n');
 
-  run('tar', [...tarOwnerArgs, '-czf', join(workRoot, 'control.tar.gz'), '-C', controlRoot, '.'], projectRoot);
-  run('tar', [...tarOwnerArgs, '-czf', join(workRoot, 'data.tar.gz'), '-C', dataRoot, '.'], projectRoot);
+  run('tar', [...tarOwnerArgs, ...tarFormatArgs, '-czf', join(workRoot, 'control.tar.gz'), '-C', controlRoot, '.'], projectRoot);
+  run('tar', [...tarOwnerArgs, ...tarFormatArgs, '-czf', join(workRoot, 'data.tar.gz'), '-C', dataRoot, '.'], projectRoot);
   const outputPath = join(outputRoot, packageName);
-  // Apple ar tries to build a Mach-O symbol table unless -S is used, which can
-  // silently omit these non-object members. OpenWrt IPKs need the three files in
-  // this exact order and do not need an archive symbol table.
-  run('ar', ['-rcS', outputPath, 'debian-binary', 'control.tar.gz', 'data.tar.gz'], workRoot);
+  // OpenWrt 21.02's official ipkg-build uses an outer GNU tar.gz container in
+  // this exact order. Some older opkg builds reject the Debian-style ar variant.
+  run('tar', [
+    ...tarOwnerArgs,
+    ...tarFormatArgs,
+    '-czf',
+    outputPath,
+    '-C',
+    workRoot,
+    'debian-binary',
+    'data.tar.gz',
+    'control.tar.gz',
+  ], projectRoot);
 
   console.log(`OpenClash Dashboard 软件包已生成：${outputPath}`);
   console.log('安装命令：opkg install /tmp/' + basename(outputPath));

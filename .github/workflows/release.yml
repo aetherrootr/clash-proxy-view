@@ -1,0 +1,91 @@
+name: Release OpenClash package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const { version } = JSON.parse(readFileSync("package.json", "utf8"));
+            const expected = `v${version}`;
+            if (process.env.RELEASE_TAG !== expected) {
+              console.error(`Tag ${process.env.RELEASE_TAG} does not match package version ${expected}.`);
+              process.exit(1);
+            }
+          '
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check source
+        run: npm run check
+
+      - name: Build OpenClash IPK
+        run: npm run build:openclash
+
+      - name: Verify package structure
+        run: |
+          package_path="$(find dist-openclash -maxdepth 1 -name '*.ipk' -print -quit)"
+          test -n "$package_path"
+          test "$(ar t "$package_path" | tr '\n' ' ')" = "debian-binary control.tar.gz data.tar.gz "
+          verify_dir="$(mktemp -d)"
+          cd "$verify_dir"
+          ar x "$GITHUB_WORKSPACE/$package_path"
+          test "$(cat debian-binary)" = "2.0"
+          tar -tzf control.tar.gz | grep -q './control'
+          tar -tzf data.tar.gz | grep -q './usr/lib/lua/luci/controller/proxy_view.lua'
+          tar -tzf data.tar.gz | grep -q './usr/share/openclash/ui/proxy-view/index.html'
+
+      - name: Generate checksums
+        run: |
+          cd dist-openclash
+          sha256sum *.ipk > SHA256SUMS
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-proxy-view-${{ github.ref_name }}
+          path: |
+            dist-openclash/*.ipk
+            dist-openclash/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              dist-openclash/*.ipk dist-openclash/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              dist-openclash/*.ipk dist-openclash/SHA256SUMS \
+              --verify-tag --generate-notes --title "proxy-view $GITHUB_REF_NAME"
+          fi

@@ -7,13 +7,11 @@ import {
   ArrowUp,
   Cable,
   CircleAlert,
-  Gauge,
   LoaderCircle,
   PlugZap,
   RefreshCw,
   Search,
   Settings2,
-  ShieldAlert,
   Unplug,
   Wifi,
   WifiOff,
@@ -33,6 +31,11 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import {
+  TrafficFlowMap,
+  type TrafficFlow,
+  type TunnelFlow,
+} from '@/components/traffic-flow-map';
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -50,10 +53,9 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { MihomoClient, type MihomoConnection, type MihomoProxy } from '@/lib/mihomo';
+import { MihomoClient, type MihomoProxy } from '@/lib/mihomo';
 
 const DEFAULT_ENDPOINT = 'http://192.168.8.1:9090';
-const DEFAULT_TEST_URL = 'https://cp.cloudflare.com/generate_204';
 const ASIA_PATTERN = /(港|HK|Hong Kong|日本|东京|大阪|JP|Japan|台|台北|新北|彰化|TW|Taiwan|新加坡|坡|狮城|SG|Singapore)/;
 
 type BaseNode = {
@@ -88,23 +90,7 @@ type SavedConfig = {
 };
 
 type PreviousConnection = { upload: number; download: number };
-
-type WebMcpTool = {
-  name: string;
-  title?: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  annotations?: { readOnlyHint?: boolean; untrustedContentHint?: boolean };
-  execute: (input: unknown) => unknown;
-};
-
-declare global {
-  interface Document {
-    readonly modelContext?: {
-      registerTool: (tool: WebMcpTool, options?: { signal?: AbortSignal }) => void | Promise<void>;
-    };
-  }
-}
+type ExitRegion = '日本' | '台湾';
 
 function regionOf(name: string) {
   if (/(港|HK|Hong Kong)/.test(name)) return '香港';
@@ -147,11 +133,20 @@ function loadConfig(): SavedConfig {
   if (typeof window === 'undefined') {
     return { endpoint: DEFAULT_ENDPOINT, secret: '', rememberSecret: false };
   }
+  const embedded = /^\/ui\/proxy-view(?:\/|$)/.test(window.location.pathname);
   return {
-    endpoint: localStorage.getItem('mihomo:endpoint') || DEFAULT_ENDPOINT,
+    endpoint: embedded
+      ? window.location.origin
+      : localStorage.getItem('mihomo:endpoint') || DEFAULT_ENDPOINT,
     secret: localStorage.getItem('mihomo:secret') || '',
     rememberSecret: Boolean(localStorage.getItem('mihomo:secret')),
   };
+}
+
+function normalizeEndpoint(value: string) {
+  const endpoint = value.trim().replace(/\/+$/, '');
+  if (!endpoint) return DEFAULT_ENDPOINT;
+  return /^https?:\/\//i.test(endpoint) ? endpoint : `http://${endpoint}`;
 }
 
 function StatusPill({ alive, active }: { alive: boolean; active: boolean }) {
@@ -172,6 +167,7 @@ function StatusPill({ alive, active }: { alive: boolean; active: boolean }) {
 export default function Home() {
   const [config, setConfig] = useState<SavedConfig>({ endpoint: DEFAULT_ENDPOINT, secret: '', rememberSecret: false });
   const [draft, setDraft] = useState<SavedConfig>(config);
+  const [configReady, setConfigReady] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -179,6 +175,8 @@ export default function Home() {
   const [error, setError] = useState('');
   const [nodes, setNodes] = useState<BaseNode[]>([]);
   const [rates, setRates] = useState<Map<string, ConnectionRates>>(new Map());
+  const [flows, setFlows] = useState<TrafficFlow[]>([]);
+  const [tunnelFlows, setTunnelFlows] = useState<TunnelFlow[]>([]);
   const [groups, setGroups] = useState<MihomoProxy[]>([]);
   const [totals, setTotals] = useState({ down: 0, up: 0, connections: 0 });
   const [query, setQuery] = useState('');
@@ -187,26 +185,23 @@ export default function Home() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [kickTarget, setKickTarget] = useState<NodeRow | null>(null);
   const [kicking, setKicking] = useState(false);
-  const [testing, setTesting] = useState<string>('');
-  const [manualDelay, setManualDelay] = useState<Map<string, number>>(new Map());
+  const [rebuildTarget, setRebuildTarget] = useState<ExitRegion | null>(null);
+  const [rebuildingRegion, setRebuildingRegion] = useState<ExitRegion | null>(null);
+  const [notice, setNotice] = useState('');
   const previousConnections = useRef<Map<string, PreviousConnection>>(new Map());
   const previousTimestamp = useRef(0);
-  const rowsRef = useRef<NodeRow[]>([]);
+  const autoConnectedConfig = useRef('');
 
   useEffect(() => {
     queueMicrotask(() => {
       const saved = loadConfig();
       setConfig(saved);
       setDraft(saved);
+      setConfigReady(true);
     });
   }, []);
 
   const client = useMemo(() => new MihomoClient(config.endpoint, config.secret), [config.endpoint, config.secret]);
-
-  const mixedContentBlocked = useMemo(() => {
-    if (typeof window === 'undefined') return false;
-    return window.isSecureContext && config.endpoint.startsWith('http://');
-  }, [config.endpoint]);
 
   const refreshTopology = useCallback(async () => {
     const [providerData, proxyData] = await Promise.all([client.providers(), client.proxies()]);
@@ -240,28 +235,64 @@ export default function Home() {
     const nodeNames = new Set(nodes.map((node) => node.name));
     const nextRates = new Map<string, ConnectionRates>();
     const nextPrevious = new Map<string, PreviousConnection>();
-    const resolveNode = (connection: MihomoConnection) =>
-      [...(connection.chains ?? []), ...(connection.providerChains ?? [])].find((name) => nodeNames.has(name));
+    const nextFlows: TrafficFlow[] = [];
+    const nextTunnelFlows: TunnelFlow[] = [];
 
     for (const connection of connections) {
-      const nodeName = resolveNode(connection);
       nextPrevious.set(connection.id, { upload: connection.upload, download: connection.download });
-      if (!nodeName) continue;
       const previous = previousConnections.current.get(connection.id);
+      const downRate = previous ? Math.max(connection.download - previous.download, 0) / elapsed : 0;
+      const upRate = previous ? Math.max(connection.upload - previous.upload, 0) / elapsed : 0;
+      const metadata = connection.metadata ?? {};
+      const chainNames = [...(connection.chains ?? []), ...(connection.providerChains ?? [])];
+      const chainText = chainNames.join(' ');
+      const nodeName = chainNames.find((name) => nodeNames.has(name));
+      const isInner = metadata.type?.toLowerCase() === 'inner';
+
+      if (!isInner) {
+        const route = /exit-node-tw|隧道\(tw\)|台湾出口/i.test(chainText)
+          ? '台湾出口'
+          : /exit-node-jp|隧道\(jp\)|日本出口/i.test(chainText)
+            ? '日本出口'
+            : chainNames.some((name) => name.toUpperCase() === 'DIRECT')
+              ? '直连'
+              : chainNames[0] || '其他出口';
+        const clientName = metadata.sourceIP
+          || metadata.process
+          || metadata.processPath?.split(/[\\/]/).at(-1)
+          || '路由器本机';
+        const destinationHost = metadata.host || metadata.destinationIP || '未知目标';
+        const destination = metadata.destinationPort
+          ? `${destinationHost}:${metadata.destinationPort}`
+          : destinationHost;
+        nextFlows.push({ id: connection.id, client: clientName, destination, route, downRate, upRate });
+      }
+
+      if (!nodeName) continue;
       const current = nextRates.get(nodeName) ?? { connectionIds: [], downRate: 0, upRate: 0, download: 0, upload: 0 };
       current.connectionIds.push(connection.id);
       current.download += connection.download;
       current.upload += connection.upload;
-      if (previous) {
-        current.downRate += Math.max(connection.download - previous.download, 0) / elapsed;
-        current.upRate += Math.max(connection.upload - previous.upload, 0) / elapsed;
-      }
+      current.downRate += downRate;
+      current.upRate += upRate;
       nextRates.set(nodeName, current);
+
+      if (isInner) {
+        const endpointText = `${metadata.host ?? ''} ${metadata.destinationIP ?? ''} ${chainText}`;
+        const exit = /tw-server|隧道\(tw\)|台湾出口/i.test(endpointText)
+          ? '台湾出口 VM'
+          : /jp-server|隧道\(jp\)|日本出口/i.test(endpointText)
+            ? '日本出口 VM'
+            : metadata.host || metadata.destinationIP || '出口 VM';
+        nextTunnelFlows.push({ id: connection.id, line: nodeName, exit, downRate, upRate });
+      }
     }
 
     previousConnections.current = nextPrevious;
     previousTimestamp.current = now;
     setRates(nextRates);
+    setFlows(nextFlows);
+    setTunnelFlows(nextTunnelFlows);
     setTotals({
       down: [...nextRates.values()].reduce((sum, item) => sum + item.downRate, 0),
       up: [...nextRates.values()].reduce((sum, item) => sum + item.upRate, 0),
@@ -271,11 +302,6 @@ export default function Home() {
   }, [client, nodes]);
 
   const connect = useCallback(async () => {
-    if (mixedContentBlocked) {
-      setError('当前页面使用 HTTPS，浏览器会阻止访问 HTTP 的本地 API。请配置 HTTPS/WSS 控制器地址。');
-      setSettingsOpen(true);
-      return;
-    }
     setConnecting(true);
     setError('');
     try {
@@ -285,11 +311,20 @@ export default function Home() {
       setConnected(true);
     } catch (cause) {
       setConnected(false);
-      setError(cause instanceof TypeError ? '无法访问 Mihomo API。请检查地址、CORS、Private Network Access 和 HTTPS 设置。' : cause instanceof Error ? cause.message : '连接失败。');
+      setError(cause instanceof TypeError
+        ? '无法访问本地 Dashboard 服务。请检查命令行进程是否仍在运行。'
+        : cause instanceof Error ? cause.message : '连接失败。');
     } finally {
       setConnecting(false);
     }
-  }, [client, mixedContentBlocked, refreshTopology]);
+  }, [client, refreshTopology]);
+
+  useEffect(() => {
+    const configKey = `${config.endpoint}\u0000${config.secret}`;
+    if (!configReady || connected || connecting || autoConnectedConfig.current === configKey) return;
+    autoConnectedConfig.current = configKey;
+    void connect();
+  }, [config.endpoint, config.secret, configReady, connect, connected, connecting]);
 
   useEffect(() => {
     if (!connected) return;
@@ -317,7 +352,7 @@ export default function Home() {
       const activity = rates.get(node.name);
       return {
         ...node,
-        latency: manualDelay.get(node.name) ?? node.latency,
+        latency: node.latency,
         connectionIds: activity?.connectionIds ?? [],
         connections: activity?.connectionIds.length ?? 0,
         downRate: activity?.downRate ?? 0,
@@ -336,17 +371,13 @@ export default function Home() {
       if (a.connections !== b.connections) return b.connections - a.connections;
       if (a.alive !== b.alive) return Number(a.alive) - Number(b.alive);
       return b.downRate + b.upRate - (a.downRate + a.upRate);
-    }), [manualDelay, nodes, query, rates, regionFilter, statusFilter]);
+    }), [nodes, query, rates, regionFilter, statusFilter]);
 
   const activeNodes = nodes.filter((node) => (rates.get(node.name)?.connectionIds.length ?? 0) > 0).length;
   const healthyNodes = nodes.filter((node) => node.alive).length;
 
-  useEffect(() => {
-    rowsRef.current = rows;
-  }, [rows]);
-
   function saveSettings() {
-    const next = { ...draft, endpoint: draft.endpoint.trim().replace(/\/+$/, '') };
+    const next = { ...draft, endpoint: normalizeEndpoint(draft.endpoint) };
     localStorage.setItem('mihomo:endpoint', next.endpoint);
     if (next.rememberSecret && next.secret) localStorage.setItem('mihomo:secret', next.secret);
     else localStorage.removeItem('mihomo:secret');
@@ -354,18 +385,6 @@ export default function Home() {
     setConfig(next);
     setConnected(false);
     setSettingsOpen(false);
-  }
-
-  async function testNode(name: string) {
-    setTesting(name);
-    try {
-      const result = await client.delay(name, DEFAULT_TEST_URL);
-      setManualDelay((current) => new Map(current).set(name, result.delay));
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '测速失败。');
-    } finally {
-      setTesting('');
-    }
   }
 
   async function kickConnections() {
@@ -382,57 +401,54 @@ export default function Home() {
     }
   }
 
-  useEffect(() => {
-    const context = document.modelContext;
-    if (!context?.registerTool) return;
-    const lifecycle = new AbortController();
-    const report = (cause: unknown) => {
-      setError(cause instanceof Error ? cause.message : 'WebMCP 操作失败。');
-    };
+  async function rebuildTunnel() {
+    if (!rebuildTarget) return;
+    const region = rebuildTarget;
+    const code = region === '日本' ? 'jp' : 'tw';
+    const serverPattern = region === '日本' ? /jp-server/i : /tw-server/i;
+    const tunnelName = `➡️ 代理隧道(${code})`;
+    const probeUrl = `http://${code}-server.aetherrootr.com/generate_204`;
 
-    const registrations = [
-      context.registerTool({
-        name: 'refresh_proxy_line_status',
-        title: '刷新代理线路状态',
-        description: '刷新当前 Mihomo 多线代理的健康、策略组和活动连接状态。',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-        annotations: { readOnlyHint: true, untrustedContentHint: false },
-        async execute() {
-          if (!connected) throw new Error('请先在页面中连接 Mihomo API。');
-          await Promise.all([refreshTopology(), refreshConnections()]);
-          return { status: 'refreshed', updatedAt: new Date().toISOString() };
-        },
-      }, { signal: lifecycle.signal }),
-      context.registerTool({
-        name: 'close_proxy_line_connections',
-        title: '关闭线路活动连接',
-        description: '关闭指定代理节点当前承载的全部活动连接；不会把节点永久移出负载均衡池。',
-        inputSchema: {
-          type: 'object',
-          properties: { lineName: { type: 'string', minLength: 1, description: '页面线路表中的完整节点名称。' } },
-          required: ['lineName'],
-          additionalProperties: false,
-        },
-        annotations: { readOnlyHint: false, untrustedContentHint: false },
-        async execute(input) {
-          const lineName = typeof input === 'object' && input !== null && 'lineName' in input
-            ? String((input as { lineName: unknown }).lineName)
-            : '';
-          if (!lineName) throw new Error('lineName 不能为空。');
-          const row = rowsRef.current.find((item) => item.name === lineName);
-          if (!row) throw new Error('没有找到这条线路。');
-          if (!row.connectionIds.length) return { lineName, closed: 0, status: 'idle' };
-          const count = row.connectionIds.length;
-          await client.closeConnections(row.connectionIds);
-          await refreshConnections();
-          return { lineName, closed: count, status: 'closed' };
-        },
-      }, { signal: lifecycle.signal }),
-    ];
+    setRebuildingRegion(region);
+    setError('');
+    setNotice('');
+    try {
+      const snapshot = await client.connections();
+      const outerConnections = (snapshot.connections ?? []).filter((connection) => {
+        const metadata = connection.metadata ?? {};
+        const endpoint = `${metadata.host ?? ''} ${metadata.destinationIP ?? ''}`;
+        return metadata.type?.toLowerCase() === 'inner' && serverPattern.test(endpoint);
+      });
 
-    for (const registration of registrations) void Promise.resolve(registration).catch(report);
-    return () => lifecycle.abort();
-  }, [client, connected, refreshConnections, refreshTopology]);
+      const results = await Promise.allSettled(
+        outerConnections.map((connection) => client.closeConnection(connection.id)),
+      );
+      const closed = results.filter((result) => result.status === 'fulfilled').length;
+      const failed = results.length - closed;
+
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      let probeFailed = false;
+      try {
+        await client.delay(tunnelName, probeUrl, 5000);
+      } catch {
+        probeFailed = true;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 800));
+      previousConnections.current.clear();
+      previousTimestamp.current = 0;
+      await Promise.all([refreshTopology(), refreshConnections()]);
+
+      const details = outerConnections.length
+        ? `已关闭 ${closed} 条外层连接${failed ? `，${failed} 条已先行消失` : ''}`
+        : '未发现活动外层连接';
+      setNotice(`${region}中转已请求重建：${details}${probeFailed ? '；探测未完成，新业务流量仍会按需建链。' : '，并已触发线路探测。'}`);
+      setRebuildTarget(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : `${region}中转重建失败。`);
+    } finally {
+      setRebuildingRegion(null);
+    }
+  }
 
   return (
     <main className="min-h-screen bg-[#071019] text-slate-100">
@@ -450,6 +466,7 @@ export default function Home() {
         </header>
 
         {error && <div className="mt-4 flex items-start gap-3 rounded-xl border border-amber-400/20 bg-amber-400/8 px-4 py-3 text-sm text-amber-100"><CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-300" /><p className="flex-1">{error}</p><button aria-label="关闭错误提示" onClick={() => setError('')} className="text-amber-200/70 hover:text-amber-100"><X className="size-4" /></button></div>}
+        {notice && <div className="mt-4 flex items-start gap-3 rounded-xl border border-emerald-400/20 bg-emerald-400/8 px-4 py-3 text-sm text-emerald-100"><RefreshCw className="mt-0.5 size-4 shrink-0 text-emerald-300" /><p className="flex-1">{notice}</p><button aria-label="关闭操作提示" onClick={() => setNotice('')} className="text-emerald-200/70 hover:text-emerald-100"><X className="size-4" /></button></div>}
 
         <section className="grid gap-3 py-5 sm:grid-cols-2 xl:grid-cols-4" aria-label="实时摘要">
           {[
@@ -464,24 +481,62 @@ export default function Home() {
           {['日本', '台湾'].map((region) => {
             const auto = groups.find((group) => group.name === `🔀 ${region}出口｜自动容灾`);
             const tunnel = groups.find((group) => group.name === `➡️ 代理隧道(${region === '日本' ? 'jp' : 'tw'})`);
-            return <article key={region} className="flex items-center justify-between gap-4 rounded-2xl border border-white/8 bg-gradient-to-r from-[#0d1b27] to-[#0a151f] px-4 py-3.5"><div className="flex min-w-0 items-center gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/5 text-lg">{region === '日本' ? '🇯🇵' : '🇹🇼'}</div><div className="min-w-0"><p className="text-sm font-medium">{region}出口</p><p className="truncate text-xs text-slate-500">隧道：{tunnel?.now ?? '等待连接'}</p></div></div><div className="text-right"><p className="text-sm text-cyan-200">{auto?.now ?? '—'}</p><p className="mt-0.5 text-xs text-slate-500">{auto?.alive === false ? '探测失败' : auto ? '探测正常' : '未发现策略组'}</p></div></article>;
+            const exitRegion = region as ExitRegion;
+            return <article key={region} className="flex items-center justify-between gap-4 rounded-2xl border border-white/8 bg-gradient-to-r from-[#0d1b27] to-[#0a151f] px-4 py-3.5"><div className="flex min-w-0 items-center gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/5 text-lg">{region === '日本' ? '🇯🇵' : '🇹🇼'}</div><div className="min-w-0"><p className="text-sm font-medium">{region}出口</p><p className="truncate text-xs text-slate-500">隧道：{tunnel?.now ?? '等待连接'}</p></div></div><div className="flex items-center gap-3"><div className="text-right"><p className="text-sm text-cyan-200">{auto?.now ?? '—'}</p><p className="mt-0.5 text-xs text-slate-500">{auto?.alive === false ? '探测失败' : auto ? '探测正常' : '未发现策略组'}</p></div><Button variant="outline" size="sm" className="shrink-0 border-white/10 bg-white/4 text-slate-300 hover:bg-white/8" onClick={() => setRebuildTarget(exitRegion)} disabled={!connected || rebuildingRegion !== null}>{rebuildingRegion === exitRegion ? <LoaderCircle className="animate-spin" /> : <RefreshCw />}重建中转</Button></div></article>;
           })}
         </section>
+
+        <TrafficFlowMap
+          flows={flows}
+          tunnelFlows={tunnelFlows}
+          lines={nodes.map((node) => {
+            const activity = rates.get(node.name);
+            return {
+              name: node.name,
+              alive: node.alive,
+              connections: activity?.connectionIds.length ?? 0,
+              downRate: activity?.downRate ?? 0,
+              upRate: activity?.upRate ?? 0,
+            };
+          })}
+        />
 
         <section className="flex min-h-[520px] flex-1 flex-col overflow-hidden rounded-2xl border border-white/8 bg-[#0a151f] shadow-[0_22px_70px_rgba(0,0,0,.22)]">
           <div className="flex flex-col gap-3 border-b border-white/8 p-4 lg:flex-row lg:items-center lg:justify-between"><div><h2 className="font-medium">亚洲中转线路</h2><p className="mt-1 text-xs text-slate-500">速度来自活动连接的字节增量；空闲不代表线路故障。</p></div><div className="flex flex-col gap-2 sm:flex-row"><div className="relative min-w-60"><Search className="pointer-events-none absolute left-2.5 top-2.5 size-4 text-slate-600" /><Input aria-label="搜索节点或机场" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索节点或机场" className="border-white/10 bg-black/15 pl-9 text-slate-200 placeholder:text-slate-600" /></div><select value={regionFilter} onChange={(event) => setRegionFilter(event.target.value)} className="h-8 rounded-lg border border-white/10 bg-[#0d1b27] px-2.5 text-sm text-slate-300 outline-none focus:border-cyan-400/50" aria-label="地区筛选"><option value="all">全部地区</option><option>香港</option><option>台湾</option><option>新加坡</option><option>日本</option></select><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="h-8 rounded-lg border border-white/10 bg-[#0d1b27] px-2.5 text-sm text-slate-300 outline-none focus:border-cyan-400/50" aria-label="状态筛选"><option value="all">全部状态</option><option value="active">传输中</option><option value="idle">空闲</option><option value="dead">故障</option></select><Button variant="outline" size="icon" aria-label="刷新" className="border-white/10 bg-white/4 text-slate-300 hover:bg-white/8" onClick={() => void Promise.all([refreshTopology(), refreshConnections()])} disabled={!connected}><RefreshCw /></Button></div></div>
 
           <div className="min-h-0 flex-1 overflow-auto"><Table><TableHeader className="sticky top-0 z-10 bg-[#0b1721]/95 backdrop-blur"><TableRow className="border-white/8 hover:bg-transparent"><TableHead className="min-w-72 text-slate-500">线路</TableHead><TableHead className="text-slate-500">状态</TableHead><TableHead className="text-right text-slate-500">延迟</TableHead><TableHead className="text-right text-slate-500">连接</TableHead><TableHead className="min-w-36 text-right text-slate-500">实时速度</TableHead><TableHead className="text-right text-slate-500">活动流量</TableHead><TableHead className="text-right text-slate-500">操作</TableHead></TableRow></TableHeader><TableBody>
-            {!connected ? <TableRow className="border-0 hover:bg-transparent"><TableCell colSpan={7} className="h-80 text-center"><div className="mx-auto flex max-w-sm flex-col items-center"><WifiOff className="size-9 text-slate-700" /><p className="mt-4 font-medium text-slate-300">连接本地 Mihomo API</p><p className="mt-2 text-sm leading-6 text-slate-500">配置控制器地址和密钥后，这里会显示每条亚洲中转线路的健康、延迟和实时速度。</p><Button className="mt-5 bg-cyan-300 text-slate-950 hover:bg-cyan-200" onClick={() => setSettingsOpen(true)}><Settings2 />配置连接</Button></div></TableCell></TableRow> : rows.length === 0 ? <TableRow className="border-0 hover:bg-transparent"><TableCell colSpan={7} className="h-80 text-center text-slate-500">当前筛选条件下没有线路。</TableCell></TableRow> : rows.map((row) => <TableRow key={row.name} className="border-white/6 hover:bg-white/[.025]"><TableCell><div className="flex items-center gap-3"><div className="grid size-8 shrink-0 place-items-center rounded-lg border border-white/8 bg-white/4 text-xs font-semibold text-slate-300">{row.region.slice(0, 1)}</div><div className="min-w-0"><p className="max-w-[420px] truncate text-sm text-slate-200" title={row.name}>{row.name}</p><p className="mt-1 text-xs text-slate-600">{row.provider} · {row.region}</p></div></div></TableCell><TableCell><StatusPill alive={row.alive} active={row.connections > 0} /></TableCell><TableCell className="text-right font-mono text-sm"><span className={!row.alive ? 'text-rose-300' : row.latency && row.latency < 150 ? 'text-emerald-300' : 'text-amber-300'}>{row.latency ? `${row.latency} ms` : '—'}</span></TableCell><TableCell className="text-right font-mono text-sm text-slate-300">{row.connections}</TableCell><TableCell className="text-right"><p className="font-mono text-sm text-sky-300">↓ {formatRate(row.downRate)}</p><p className="mt-1 font-mono text-xs text-violet-300/80">↑ {formatRate(row.upRate)}</p></TableCell><TableCell className="text-right font-mono text-xs text-slate-500">{formatBytes(row.download + row.upload)}</TableCell><TableCell><div className="flex justify-end gap-1.5"><Button variant="ghost" size="sm" className="text-slate-400 hover:bg-white/6 hover:text-cyan-200" onClick={() => void testNode(row.name)} disabled={testing === row.name}>{testing === row.name ? <LoaderCircle className="animate-spin" /> : <Gauge />}测速</Button><Button variant="destructive" size="sm" onClick={() => setKickTarget(row)} disabled={!row.connectionIds.length}><Unplug />踢掉连接</Button></div></TableCell></TableRow>)}
+            {!connected ? <TableRow className="border-0 hover:bg-transparent"><TableCell colSpan={7} className="h-80 text-center"><div className="mx-auto flex max-w-sm flex-col items-center"><WifiOff className="size-9 text-slate-700" /><p className="mt-4 font-medium text-slate-300">连接本地 Mihomo API</p><p className="mt-2 text-sm leading-6 text-slate-500">配置控制器地址和密钥后，这里会显示每条亚洲中转线路的健康、延迟和实时速度。</p><Button className="mt-5 bg-cyan-300 text-slate-950 hover:bg-cyan-200" onClick={() => setSettingsOpen(true)}><Settings2 />配置连接</Button></div></TableCell></TableRow> : rows.length === 0 ? <TableRow className="border-0 hover:bg-transparent"><TableCell colSpan={7} className="h-80 text-center text-slate-500">当前筛选条件下没有线路。</TableCell></TableRow> : rows.map((row) => <TableRow key={row.name} className="border-white/6 hover:bg-white/[.025]"><TableCell><div className="flex items-center gap-3"><div className="grid size-8 shrink-0 place-items-center rounded-lg border border-white/8 bg-white/4 text-xs font-semibold text-slate-300">{row.region.slice(0, 1)}</div><div className="min-w-0"><p className="max-w-[420px] truncate text-sm text-slate-200" title={row.name}>{row.name}</p><p className="mt-1 text-xs text-slate-600">{row.provider} · {row.region}</p></div></div></TableCell><TableCell><StatusPill alive={row.alive} active={row.connections > 0} /></TableCell><TableCell className="text-right font-mono text-sm"><span className={!row.alive ? 'text-rose-300' : row.latency && row.latency < 150 ? 'text-emerald-300' : 'text-amber-300'}>{row.latency ? `${row.latency} ms` : '—'}</span></TableCell><TableCell className="text-right font-mono text-sm text-slate-300">{row.connections}</TableCell><TableCell className="text-right"><p className="font-mono text-sm text-sky-300">↓ {formatRate(row.downRate)}</p><p className="mt-1 font-mono text-xs text-violet-300/80">↑ {formatRate(row.upRate)}</p></TableCell><TableCell className="text-right font-mono text-xs text-slate-500">{formatBytes(row.download + row.upload)}</TableCell><TableCell><div className="flex justify-end"><Button variant="destructive" size="sm" onClick={() => setKickTarget(row)} disabled={!row.connectionIds.length}><Unplug />踢掉连接</Button></div></TableCell></TableRow>)}
           </TableBody></Table></div>
         </section>
 
-        <footer className="flex flex-col gap-1 pt-4 text-xs text-slate-600 sm:flex-row sm:items-center sm:justify-between"><p>密钥仅保存在当前浏览器；关闭连接不会永久移除节点。</p><p className="font-mono">{config.endpoint}</p></footer>
+        <footer className="flex flex-col gap-1 pt-4 text-xs text-slate-600 sm:flex-row sm:items-center sm:justify-between"><p>密钥仅保存在本机浏览器中；关闭连接不会永久移除节点。</p><p className="font-mono">{config.endpoint}</p></footer>
       </div>
 
-      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}><DialogContent className="border-white/10 bg-[#0c1823] text-slate-100 sm:max-w-lg"><DialogHeader><DialogTitle>连接 Mihomo API</DialogTitle><DialogDescription className="text-slate-400">网页直接从浏览器访问控制器，地址与密钥不会发送到本站服务器。</DialogDescription></DialogHeader><div className="space-y-4 py-1"><div><label htmlFor="controller-endpoint" className="mb-1.5 block text-sm text-slate-300">控制器地址</label><Input id="controller-endpoint" value={draft.endpoint} onChange={(event) => setDraft({ ...draft, endpoint: event.target.value })} placeholder={DEFAULT_ENDPOINT} className="border-white/10 bg-black/20 font-mono text-slate-100" /></div><div><label htmlFor="controller-secret" className="mb-1.5 block text-sm text-slate-300">API 密钥</label><Input id="controller-secret" type="password" value={draft.secret} onChange={(event) => setDraft({ ...draft, secret: event.target.value })} placeholder="Mihomo secret" className="border-white/10 bg-black/20 font-mono text-slate-100" /></div><div className="flex items-center justify-between rounded-xl border border-white/8 bg-white/[.025] px-3 py-3"><div><p className="text-sm text-slate-300">记住密钥</p><p className="mt-0.5 text-xs text-slate-500">写入此浏览器的 localStorage</p></div><Switch aria-label="记住 API 密钥" checked={draft.rememberSecret} onCheckedChange={(checked) => setDraft({ ...draft, rememberSecret: checked })} /></div>{(typeof window !== 'undefined' && window.isSecureContext && draft.endpoint.startsWith('http://')) && <div className="flex gap-3 rounded-xl border border-amber-400/20 bg-amber-400/8 p-3 text-sm leading-5 text-amber-100"><ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber-300" /><p>Cloudflare HTTPS 页面不能调用 HTTP API。请使用 Mihomo 的 <code className="text-amber-200">external-controller-tls</code>，并配置 CORS 与 Private Network Access。</p></div>}</div><DialogFooter><Button variant="outline" className="border-white/10 bg-white/4" onClick={() => setSettingsOpen(false)}>取消</Button><Button className="bg-cyan-300 text-slate-950 hover:bg-cyan-200" onClick={saveSettings}>保存</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+        <DialogContent className="border-white/10 bg-[#0c1823] text-slate-100 sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>连接本地 Clash API</DialogTitle>
+            <DialogDescription className="text-slate-400">本地命令行服务代为连接控制器；地址与密钥不会上传到任何云端服务。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-1">
+            <div>
+              <label htmlFor="controller-endpoint" className="mb-1.5 block text-sm text-slate-300">控制器地址</label>
+              <Input id="controller-endpoint" value={draft.endpoint} onChange={(event) => setDraft({ ...draft, endpoint: event.target.value })} placeholder="192.168.8.1:9090" className="border-white/10 bg-black/20 font-mono text-slate-100" />
+              <p className="mt-1.5 text-xs text-slate-500">可以直接填写 IP 和端口，未写协议时自动使用 http://。</p>
+            </div>
+            <div>
+              <label htmlFor="controller-secret" className="mb-1.5 block text-sm text-slate-300">API 密钥</label>
+              <Input id="controller-secret" type="password" value={draft.secret} onChange={(event) => setDraft({ ...draft, secret: event.target.value })} placeholder="Mihomo secret" className="border-white/10 bg-black/20 font-mono text-slate-100" />
+            </div>
+            <div className="flex items-center justify-between rounded-xl border border-white/8 bg-white/[.025] px-3 py-3"><div><p className="text-sm text-slate-300">记住密钥</p><p className="mt-0.5 text-xs text-slate-500">仅写入当前浏览器的 localStorage</p></div><Switch aria-label="记住 API 密钥" checked={draft.rememberSecret} onCheckedChange={(checked) => setDraft({ ...draft, rememberSecret: checked })} /></div>
+          </div>
+          <DialogFooter><Button variant="outline" className="border-white/10 bg-white/4" onClick={() => setSettingsOpen(false)}>取消</Button><Button className="bg-cyan-300 text-slate-950 hover:bg-cyan-200" onClick={saveSettings}>保存并连接</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog open={Boolean(kickTarget)} onOpenChange={(open) => !open && setKickTarget(null)}><AlertDialogContent className="border-white/10 bg-[#0c1823] text-slate-100"><AlertDialogHeader><AlertDialogMedia className="bg-rose-400/10 text-rose-300"><Unplug /></AlertDialogMedia><AlertDialogTitle>关闭这条线路的活动连接？</AlertDialogTitle><AlertDialogDescription className="text-slate-400"><span className="block break-all text-slate-200">{kickTarget?.name}</span><span className="mt-2 block">将关闭 {kickTarget?.connectionIds.length ?? 0} 条当前连接。应用可能立即重连，节点也不会从负载均衡池中永久移除。</span></AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={kicking}>取消</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={() => void kickConnections()} disabled={kicking}>{kicking ? <LoaderCircle className="animate-spin" /> : <Unplug />}确认关闭</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
+
+      <AlertDialog open={Boolean(rebuildTarget)} onOpenChange={(open) => !open && !rebuildingRegion && setRebuildTarget(null)}><AlertDialogContent className="border-white/10 bg-[#0c1823] text-slate-100"><AlertDialogHeader><AlertDialogMedia className="bg-cyan-400/10 text-cyan-300"><RefreshCw /></AlertDialogMedia><AlertDialogTitle>重建{rebuildTarget}中转？</AlertDialogTitle><AlertDialogDescription className="text-slate-400">将关闭{rebuildTarget}出口当前连接到出口 VM 的外层 MUX 隧道，并立即触发一次线路探测。相关业务会短暂断开后按需重连，另一个地区的出口不受影响。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={Boolean(rebuildingRegion)}>取消</AlertDialogCancel><AlertDialogAction onClick={() => void rebuildTunnel()} disabled={Boolean(rebuildingRegion)}>{rebuildingRegion ? <LoaderCircle className="animate-spin" /> : <RefreshCw />}确认重建</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
     </main>
   );
 }

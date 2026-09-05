@@ -28,12 +28,15 @@ export type MihomoConnection = {
   chains?: string[];
   providerChains?: string[];
   metadata?: {
+    type?: string;
     host?: string;
     destinationIP?: string;
     destinationPort?: string;
     network?: string;
     process?: string;
+    processPath?: string;
     sourceIP?: string;
+    sourcePort?: string;
   };
 };
 
@@ -46,6 +49,11 @@ export type ConnectionSnapshot = {
 export type ProxyResponse = { proxies?: Record<string, MihomoProxy> };
 export type ProviderResponse = { providers?: Record<string, MihomoProvider> };
 
+function isEmbeddedDashboard() {
+  return typeof window !== 'undefined'
+    && /^\/ui\/proxy-view(?:\/|$)/.test(window.location.pathname);
+}
+
 export class MihomoClient {
   readonly baseUrl: string;
   readonly secret: string;
@@ -56,11 +64,16 @@ export class MihomoClient {
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const embedded = isEmbeddedDashboard();
     const headers = new Headers(init?.headers);
+    if (!embedded) headers.set('X-Mihomo-Endpoint', this.baseUrl);
     if (this.secret) headers.set('Authorization', `Bearer ${this.secret}`);
     if (init?.body) headers.set('Content-Type', 'application/json');
 
-    const response = await fetch(`${this.baseUrl}${path}`, {
+    const requestUrl = embedded
+      ? new URL(path, `${this.baseUrl}/`).toString()
+      : `/api/mihomo${path}`;
+    const response = await fetch(requestUrl, {
       ...init,
       headers,
       cache: 'no-store',

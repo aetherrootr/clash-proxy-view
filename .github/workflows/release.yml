@@ -47,6 +47,9 @@ jobs:
       - name: Check source
         run: npm run check
 
+      - name: Verify gradual replacement behavior
+        run: npm run test:guard
+
       - name: Build OpenClash IPK
         run: npm run build:openclash
 
@@ -62,6 +65,10 @@ jobs:
           tar -tzf control.tar.gz | grep -q './control'
           tar -tzf data.tar.gz | grep -q './usr/lib/lua/luci/controller/proxy_view.lua'
           tar -tzf data.tar.gz | grep -q './usr/share/openclash/ui/proxy-view/index.html'
+          tar -tzf data.tar.gz | grep -q './usr/share/proxy-view/guard.rb'
+          tar -tzf data.tar.gz | grep -q './etc/init.d/proxy-view-guard'
+          tar -tzf data.tar.gz | grep -q './etc/config/proxy_view_guard'
+          tar -tzf data.tar.gz | grep -q './usr/lib/lua/luci/view/proxy_view/guard_status.htm'
 
       - name: Generate checksums
         run: |

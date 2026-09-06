@@ -3,6 +3,7 @@
 import { spawnSync } from 'node:child_process';
 import {
   cpSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -43,6 +44,8 @@ const controlRoot = join(workRoot, 'control');
 const dashboardRoot = join(dataRoot, 'usr', 'share', 'openclash', 'ui', 'proxy-view');
 const controllerRoot = join(dataRoot, 'usr', 'lib', 'lua', 'luci', 'controller');
 const viewRoot = join(dataRoot, 'usr', 'lib', 'lua', 'luci', 'view', 'proxy_view');
+const guardRoot = join(dataRoot, 'usr', 'share', 'proxy-view');
+const nginxRoot = join(dataRoot, 'etc', 'nginx', 'gl-conf.d');
 
 function visitFiles(directory, callback) {
   for (const name of readdirSync(directory)) {
@@ -77,11 +80,21 @@ try {
   mkdirSync(viewRoot, { recursive: true });
   cpSync(join(sourceRoot, 'controller', 'proxy_view.lua'), join(controllerRoot, 'proxy_view.lua'));
   cpSync(join(sourceRoot, 'view', 'redirect.htm'), join(viewRoot, 'redirect.htm'));
+  cpSync(join(sourceRoot, 'view', 'guard_status.htm'), join(viewRoot, 'guard_status.htm'));
+  mkdirSync(guardRoot, { recursive: true });
+  mkdirSync(join(dataRoot, 'etc', 'init.d'), { recursive: true });
+  mkdirSync(join(dataRoot, 'etc', 'config'), { recursive: true });
+  cpSync(join(sourceRoot, 'guard', 'guard.rb'), join(guardRoot, 'guard.rb'));
+  cpSync(join(sourceRoot, 'guard', 'proxy-view-guard.init'), join(dataRoot, 'etc', 'init.d', 'proxy-view-guard'));
+  chmodSync(join(dataRoot, 'etc', 'init.d', 'proxy-view-guard'), 0o755);
+  cpSync(join(sourceRoot, 'guard', 'proxy_view_guard.config'), join(dataRoot, 'etc', 'config', 'proxy_view_guard'));
+  mkdirSync(nginxRoot, { recursive: true });
+  cpSync(join(sourceRoot, 'nginx', 'proxy-view-luci-ubus.conf'), join(nginxRoot, 'proxy-view-luci-ubus.conf'));
 
   mkdirSync(controlRoot, { recursive: true });
   const installedSize = Math.ceil(
-    [...readdirSync(dashboardRoot)].reduce((sum, name) => {
-      const path = join(dashboardRoot, name);
+    [...readdirSync(dataRoot)].reduce((sum, name) => {
+      const path = join(dataRoot, name);
       if (!statSync(path).isDirectory()) return sum + statSync(path).size;
       let size = 0;
       visitFiles(path, (file) => { size += statSync(file).size; });
@@ -92,18 +105,55 @@ try {
 Version: ${packageVersion}-1
 Architecture: all
 Maintainer: aether
-Depends: luci-base, luci-app-openclash
+Depends: luci-base, luci-app-openclash, ruby, ruby-yaml, curl
 Section: luci
 Priority: optional
 Installed-Size: ${installedSize}
-Description: LuCI launcher and embedded Mihomo dashboard for proxy-view.
+Description: Mihomo dashboard with conservative native load-balancer connection cleanup.
 `);
+  writeFileSync(join(controlRoot, 'conffiles'), '/etc/config/proxy_view_guard\n');
   writeFileSync(join(controlRoot, 'postinst'), `#!/bin/sh
-[ -n "$IPKG_INSTROOT" ] || rm -f /tmp/luci-indexcache
+if [ -z "$IPKG_INSTROOT" ]; then
+  # Keep upgrades self-contained. Old releases stored node-selection settings
+  # which are no longer used by the native load-balancer monitor.
+  if ! uci -q get proxy_view_guard.main >/dev/null 2>&1; then
+    uci set proxy_view_guard.main='global'
+    uci set proxy_view_guard.main.enabled='0'
+  fi
+  for section in $(uci show proxy_view_guard 2>/dev/null | sed -n 's/^proxy_view_guard\\.\\([^.=]*\\)=exit$/\\1/p'); do
+    uci -q delete proxy_view_guard.$section.slow_ms >/dev/null 2>&1 || true
+    uci -q delete proxy_view_guard.$section.candidate_timeout_ms >/dev/null 2>&1 || true
+    uci -q delete proxy_view_guard.$section.switch_cooldown >/dev/null 2>&1 || true
+    uci -q delete proxy_view_guard.$section.candidates >/dev/null 2>&1 || true
+    uci -q delete proxy_view_guard.$section.excluded >/dev/null 2>&1 || true
+  done
+  uci commit proxy_view_guard
+
+  # GL.iNet places nginx in front of uhttpd but does not expose uhttpd's
+  # /ubus/ handler. The packaged server snippet restores that standard path.
+  if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+    uci set luci.main.ubuspath='/ubus/'
+    uci commit luci
+    nginx -s reload
+  fi
+  rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+  rm -rf /tmp/luci-modulecache
+  /etc/init.d/proxy-view-guard enable
+  /etc/init.d/proxy-view-guard restart
+fi
+exit 0
+`, { mode: 0o755 });
+  writeFileSync(join(controlRoot, 'prerm'), `#!/bin/sh
+if [ -z "$IPKG_INSTROOT" ]; then
+  /etc/init.d/proxy-view-guard stop
+  /etc/init.d/proxy-view-guard disable
+fi
 exit 0
 `, { mode: 0o755 });
   writeFileSync(join(controlRoot, 'postrm'), `#!/bin/sh
 [ -n "$IPKG_INSTROOT" ] || rm -f /tmp/luci-indexcache
+[ -n "$IPKG_INSTROOT" ] || rm -f /tmp/luci-indexcache.*
+[ -n "$IPKG_INSTROOT" ] || rm -rf /tmp/luci-modulecache
 exit 0
 `, { mode: 0o755 });
   writeFileSync(join(workRoot, 'debian-binary'), '2.0\n');

@@ -12,10 +12,17 @@
   (function () {
     var hostname = window.location.hostname;
     var host = hostname.indexOf(':') >= 0 ? '[' + hostname + ']' : hostname;
-    var target = 'http://' + host + ':9090/ui/proxy-view/';
+    var base = 'http://' + host + ':9090/ui/proxy-view/';
     var link = document.getElementById('proxy-view-link');
-    link.href = target;
-    window.setTimeout(function () { window.location.replace(target); }, 250);
+    link.href = base;
+    XHR.get('<%=luci.dispatcher.build_url("admin","services","proxy-view","dashboard-token")%>', null, function (xhr, data) {
+      var target = base;
+      if (data && typeof data.secret === 'string' && data.secret) {
+        target += '#proxy-view-auth=' + encodeURIComponent(data.secret);
+      }
+      link.href = target;
+      window.setTimeout(function () { window.location.replace(target); }, 100);
+    });
   }());
 </script>
 

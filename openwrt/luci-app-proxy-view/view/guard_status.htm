@@ -1,0 +1,175 @@
+<%+header%>
+<script type="text/javascript">
+(function(){
+  /*
+   * Some GL.iNet nginx builds redirect /ubus/ to an HTML page.  LuCI 22.x
+   * follows the redirect, sees the final HTTP 200 and caches /ubus/ as its
+   * JSON-RPC endpoint.  Repair the current browser tab before this view starts
+   * issuing requests.  The post-install hook also fixes the server-side value
+   * for new sessions.
+   */
+  var rpcUrl='/ubus/';
+  try {
+    if (window.L && L.rpc && typeof L.rpc.setBaseURL === 'function')
+      L.rpc.setBaseURL(rpcUrl);
+
+    var key='luci-session-store';
+    var data=JSON.parse(window.sessionStorage.getItem(key)||'{}');
+    var changed=false;
+    Object.keys(data).forEach(function(sid){
+      if (data[sid] && data[sid].rpcBaseURL !== rpcUrl) {
+        data[sid].rpcBaseURL=rpcUrl;
+        changed=true;
+      }
+    });
+    if (changed) {
+      window.sessionStorage.setItem(key,JSON.stringify(data));
+      window.location.replace(window.location.href);
+    }
+  }
+  catch (e) {
+    /* Private browsing may deny sessionStorage; the live L.rpc fix still works. */
+  }
+})();
+</script>
+<style>
+.pv-card{border:1px solid #d8dde3;border-radius:10px;padding:16px;margin:12px 0;background:#fff}
+.pv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.pv-field label{display:block;font-size:12px;color:#667;margin-bottom:4px}.pv-field input,.pv-field select{width:100%;box-sizing:border-box}
+.pv-row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.pv-actions{display:flex;gap:7px;flex-wrap:wrap}.pv-muted{color:#6b7280;font-size:12px}.pv-pill{display:inline-flex;gap:6px;align-items:center;border:1px solid #ccd3da;border-radius:999px;padding:4px 7px;margin:3px}
+.pv-danger{color:#a21caf}.pv-table{width:100%;margin-top:10px}.pv-table td,.pv-table th{padding:7px;text-align:left;border-bottom:1px solid #e5e7eb}
+.pv-ok{color:#087f5b}.pv-warn{color:#b45309}.pv-empty{padding:25px;text-align:center;color:#6b7280}
+.pv-node-list{max-height:360px;overflow:auto;border:1px solid #e5e7eb;border-radius:6px;margin:8px 0}.pv-node-list .pv-table{margin:0}
+@media(prefers-color-scheme:dark){.pv-card{background:#17202a;border-color:#334155}.pv-table td,.pv-table th{border-color:#334155}.pv-pill{border-color:#475569}}
+</style>
+
+<h2><%:渐进换线%></h2>
+<p><%:守护进程观察订阅原有的“⚡ …出口｜多线加速”及 Clash Provider 健康状态。机场线路连续判为不可用且对应连接持续空闲后，每次只断开一条；新连接由 Clash 原生负载均衡自动选择。仍有字节增长的连接始终保留。%></p>
+<div class="pv-card pv-row">
+  <div><strong><%:守护服务%></strong><div id="pv-service" class="pv-muted"><%:正在读取状态…%></div></div>
+  <label><input id="pv-global" type="checkbox"> <%:启用后台巡检%></label>
+</div>
+<div id="pv-error" class="alert-message error" style="display:none"></div>
+<div id="pv-exits"></div>
+
+<script type="text/javascript">
+(function(){
+  var stateUrl='<%=luci.dispatcher.build_url("admin","services","proxy-view","guard-status")%>';
+  var actionUrl='<%=luci.dispatcher.build_url("admin","services","proxy-view","guard-action")%>';
+  var root=document.getElementById('pv-exits'), last=null, saving=false, dirty=false, requests=[];
+  var phases={monitoring:'巡检中',paused:'已暂停',bypassed:'已跳过：当前选择链未经过多线组',unavailable:'无法识别出口服务器'};
+  function node(tag, cls, text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+  function showError(message){var e=document.getElementById('pv-error');e.textContent=message||'';e.style.display=message?'block':'none'}
+  function pump(){
+    if(saving||!requests.length)return;
+    var job=requests.shift();saving=true;showError('');
+    XHR.post(actionUrl,{payload:JSON.stringify(job.payload)},function(xhr,data){
+      saving=false;
+      var ok=Boolean(data&&data.ok);
+      if(!ok)showError((data&&data.error)||'操作失败。');
+      if(job.done)job.done(ok);
+      if(requests.length)pump();
+      else window.setTimeout(function(){dirty=false;load()},1500)
+    });
+  }
+  function post(payload,done){requests.push({payload:payload,done:done});pump()}
+  function inputField(grid,label,key,value,min,max){
+    var box=node('div','pv-field'), lab=node('label','',label), input=node('input');
+    input.type='number';input.name=key;input.value=value;input.min=min;input.max=max;
+    box.appendChild(lab);box.appendChild(input);grid.appendChild(box)
+  }
+  function renderExit(item){
+    var card=node('section','pv-card'), head=node('div','pv-row'), title=node('div');
+    title.appendChild(node('h3','',item.id+' · '+item.group));
+    title.appendChild(node('div','pv-muted','监听原生多线组 · '+(phases[item.phase]||item.phase)+' · 出口：'+(item.endpoint||'未识别')));
+    head.appendChild(title);
+    var actions=node('div','pv-actions'), saveTop=node('button','btn cbi-button cbi-button-apply','保存设置');
+    var assess=node('button','btn cbi-button cbi-button-action','立即评估');
+    actions.appendChild(saveTop);assess.onclick=function(){post({operation:'assess',logical:item.id})};actions.appendChild(assess);head.appendChild(actions);card.appendChild(head);
+    if(!item.attached)card.appendChild(node('div','alert-message warning',item.tunnel_group+' 的当前选择链没有经过 '+item.group+'。该出口不会自动断开连接，处理方式已经保存为“只观察”。'));
+
+    var settings=item.settings||{}, grid=node('div','pv-grid');
+    var enabled=node('div','pv-field'), enabledLabel=node('label'), enabledInput=node('input');
+    enabledInput.type='checkbox';enabledInput.name='enabled';enabledInput.checked=Boolean(item.enabled);
+    enabledLabel.appendChild(enabledInput);enabledLabel.appendChild(document.createTextNode(' 纳入自动检查'));enabled.appendChild(enabledLabel);grid.appendChild(enabled);
+    var modeBox=node('div','pv-field'), modeLabel=node('label','','处理方式'), mode=node('select');mode.name='mode';
+    [['observe','只观察'],['auto','自动逐条断开失效线路']].forEach(function(pair){var o=node('option','',pair[1]);o.value=pair[0];o.selected=settings.mode===pair[0];mode.appendChild(o)});
+    modeBox.appendChild(modeLabel);modeBox.appendChild(mode);grid.appendChild(modeBox);
+    inputField(grid,'空闲保护（秒）','idle_seconds',settings.idle_seconds||120,120,86400);
+    inputField(grid,'检查间隔（秒）','check_interval',settings.check_interval||60,15,3600);
+    inputField(grid,'连续失败轮数','failure_rounds',settings.failure_rounds||3,1,20);
+    inputField(grid,'逐条退出间隔（秒）','retire_interval',settings.retire_interval||60,30,3600);
+    card.appendChild(grid);
+
+    var saveTimer=null, pendingSaves=0, savedTimer=null;
+    function save(){
+      dirty=true;
+      pendingSaves+=1;saveTop.disabled=true;saveTop.textContent='正在保存…';
+      var payload={operation:'save',logical:item.id,settings:{enabled:enabledInput.checked,mode:mode.value}};
+      grid.querySelectorAll('input[type=number]').forEach(function(e){payload.settings[e.name]=Number(e.value)});
+      post(payload,function(ok){
+        pendingSaves=Math.max(0,pendingSaves-1);
+        if(pendingSaves)return;
+        saveTop.disabled=false;saveTop.textContent=ok?'已保存':'保存失败';
+        if(savedTimer)window.clearTimeout(savedTimer);
+        savedTimer=window.setTimeout(function(){saveTop.textContent='保存设置'},1800)
+      })
+    }
+    function scheduleSave(){
+      dirty=true;
+      if(saveTimer)window.clearTimeout(saveTimer);
+      saveTimer=window.setTimeout(function(){saveTimer=null;save()},50)
+    }
+
+    enabledInput.oninput=scheduleSave;enabledInput.onchange=scheduleSave;mode.onchange=scheduleSave;
+    grid.querySelectorAll('input[type=number]').forEach(function(e){
+      e.oninput=function(){dirty=true};e.onchange=scheduleSave
+    });
+
+    saveTop.onclick=save;
+    var saveButton=node('button','btn cbi-button cbi-button-apply','保存此出口设置');saveButton.onclick=save;card.appendChild(saveButton);
+    card.appendChild(node('p','pv-muted','本插件不新增代理组、不主动探测节点、不指定机场节点，也不修改 Clash 的选路。它复用 Provider 已维护的 alive 与延迟历史；逐条断开后，只有新的业务请求需要连接时，Clash 才会按订阅原有多线组补建连接。'));
+
+    var table=node('table','pv-table'), tr=node('tr');
+    ['机场线路','线路探测','流量','空闲观察','保护状态','手动操作'].forEach(function(v){tr.appendChild(node('th','',v))});table.appendChild(tr);
+    (item.tunnels||[]).forEach(function(tunnel){
+      var row=node('tr');row.appendChild(node('td','',tunnel.line||'未知'));
+      var probe=tunnel.probeable===false?'同名节点来源不唯一，仅观察':(tunnel.line_delays||[]).map(function(value){return value==null?'超时':value+' ms'}).join(' / ')||'等待探测';
+      if(Number(tunnel.line_failures||0)>0)probe+=' · 连续失败 '+tunnel.line_failures+' 轮';
+      row.appendChild(node('td',Number(tunnel.line_failures||0)>0?'pv-warn':'pv-ok',probe));
+      row.appendChild(node('td','',String(tunnel.download||0)+' ↓ / '+String(tunnel.upload||0)+' ↑'));
+      row.appendChild(node('td','',String(tunnel.idle_seconds||0)+' 秒'));
+      var reason=tunnel.protection_reason, protection='持续空闲';
+      if(reason==='transferring')protection='正在传输，受保护';
+      else if(reason==='observing')protection='观察中，还需 '+Math.max(0,Number(settings.idle_seconds||120)-Number(tunnel.idle_seconds||0))+' 秒';
+      else if(reason===undefined&&tunnel.protected)protection='仍在保护期';
+      row.appendChild(node('td',tunnel.protected?'pv-ok':'pv-warn',protection));
+      var cell=node('td'), kick=node('button','btn cbi-button cbi-button-negative','强制踢掉');
+      kick.onclick=function(){if(confirm('这会立即中断该连接。确认强制踢掉 '+(tunnel.line||tunnel.id)+'？'))post({operation:'kick',logical:item.id,connection:tunnel.id})};
+      cell.appendChild(kick);row.appendChild(cell);table.appendChild(row)
+    });
+    if(!(item.tunnels||[]).length){var empty=node('tr'), cell=node('td','pv-empty','当前没有匹配到该出口的多线连接。');cell.colSpan=6;empty.appendChild(cell);table.appendChild(empty)}
+    card.appendChild(table);
+    var events=node('details'), summary=node('summary','','最近处理记录'), pre=node('pre');
+    pre.style.whiteSpace='pre-wrap';pre.textContent=(item.events||[]).map(function(e){return new Date(e.time*1000).toLocaleTimeString()+' '+e.message}).join('\n');
+    events.appendChild(summary);events.appendChild(pre);card.appendChild(events);return card
+  }
+  function render(data){
+    last=data;var global=document.getElementById('pv-global');global.checked=Boolean(data.enabled);
+    document.getElementById('pv-service').textContent=data.running?'运行中 · 已发现 '+(data.exits||[]).length+' 个逻辑出口':'未运行、正在重启或状态已过期';
+    root.innerHTML='';(data.exits||[]).forEach(function(item){root.appendChild(renderExit(item))});
+    if(!(data.exits||[]).length)root.appendChild(node('div','pv-card pv-empty','没有发现完整的 exit-node(<id>)、➡️ 代理隧道(<id>) 与订阅原生 ⚡ …出口｜多线加速。'))
+  }
+  function load(){if(saving||dirty)return;XHR.get(stateUrl,null,function(xhr,data){if(data&&!dirty)render(data)})}
+  var globalTimer=null, globalInput=document.getElementById('pv-global');
+  function saveGlobal(){
+    dirty=true;
+    if(globalTimer)window.clearTimeout(globalTimer);
+    globalTimer=window.setTimeout(function(){globalTimer=null;post({operation:'global',enabled:globalInput.checked})},50)
+  }
+  globalInput.oninput=saveGlobal;globalInput.onchange=saveGlobal;
+  load();window.setInterval(load,5000)
+})();
+</script>
+<%+footer%>

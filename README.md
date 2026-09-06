@@ -63,11 +63,17 @@ npm run build:openclash
 ```
 
 产物位于 `dist-openclash/luci-app-proxy-view_<版本>-1_all.ipk`。上传到路由器的
-`/tmp` 后安装：
+`/tmp` 后只需安装这个 IPK：
 
 ```bash
-opkg install /tmp/luci-app-proxy-view_0.1.0-1_all.ipk
+opkg install /tmp/luci-app-proxy-view_0.3.0-1_all.ipk
 ```
+
+IPK 会通过 `Depends` 安装 LuCI、OpenClash、Ruby、ruby-yaml 与 curl 依赖，安装
+Dashboard 静态文件、LuCI 页面、守护进程、UCI 默认配置和 GL.iNet nginx 的 ubus
+补丁，并完成旧配置迁移、LuCI 缓存清理、服务开机启用和立即启动。已存在的
+`/etc/config/proxy_view_guard` 会作为 conffile 保留。OpenClash 本身需要能够从当前
+软件源安装，且运行配置使用 9090 控制端口。
 
 安装后，LuCI 的“服务 → 多线代理控制台”会跳转到：
 
@@ -76,7 +82,9 @@ http://<当前路由器地址>:9090/ui/proxy-view/
 ```
 
 嵌入模式直接访问同源 Mihomo API，不依赖本机命令行中转。首次使用仍需在页面中
-填写控制器 `secret`。卸载命令：
+填写控制器 `secret`。从已登录的 LuCI“多线代理控制台”入口打开时，插件会读取
+当前 OpenClash 配置中的密钥，通过不会发送到服务器的 URL fragment 一次性交给
+Dashboard，并立即从地址栏清除；直接访问 9090 时仍可手工填写。卸载命令：
 
 ```bash
 opkg remove luci-app-proxy-view
@@ -84,6 +92,62 @@ opkg remove luci-app-proxy-view
 
 该软件包不会修改 OpenClash 源码；OpenClash 必须已经安装，并使用 9090 作为外部
 控制端口。
+
+### 渐进换线
+
+控制台的“渐进换线”入口打开 LuCI 管理页，也可从“服务 → 多线代理控制台 →
+渐进换线”进入。新版 IPK 包含 `proxy-view-guard` 常驻服务，依赖 Ruby、ruby-yaml
+和 curl。守护进程会动态发现完整的 `exit-node(<逻辑名>)`、
+`➡️ 代理隧道(<逻辑名>)` 与订阅原有的 `⚡ …出口｜多线加速`，不会向 OpenClash
+配置注入代理组，也不会指定或改选机场节点。每个逻辑出口有独立的运行方式及检查
+参数。关闭浏览器不会停止路由器服务。管理页使用现有 LuCI 登录，不新增监听端口
+或公开状态文件。
+
+守护进程递归检查代理隧道当前的组选择链。如果某个代理隧道不再经过其原生多线组，
+该逻辑出口立即跳过处理，并把 UCI 中的处理方式持久化回“只观察”。重新经过多线组
+后仍保持只观察，必须由用户再次保存为自动处理。其他逻辑出口不受影响。
+
+管理页可以立即评估、启停单个出口、修改空闲保护时间/检查间隔/失败轮数/逐条
+退出间隔，并查看或按 ID 强制踢掉一条隧道连接。手动强制踢线需要二次确认；
+服务端还会重新验证连接确实属于所选逻辑出口。守护进程复用 Clash Provider
+维护的节点 `alive` 状态与最近延迟历史，不额外发起逐节点探测。
+
+旧连接按照下面的条件逐步处理：
+
+- 每 5 秒观察外层隧道的上传、下载计数。即使只增长一个字节，也重新计时并保留。
+- 连续至少 120 秒没有字节增长才可能退出；采样间隔超过 20 秒、计数重置或 API
+  出错会重置观察，不能把监测中断当成空闲。可将等待时间加长到 3600 秒。
+- 关闭前重新读取连接，确认标识、启动时间及字节计数都未变化。自动处理每次只
+  按连接 ID 关闭一条，间隔至少 60 秒，绝不调用批量关闭接口。
+- 同一机场线路需要连续多轮完全探测失败，且连接持续空闲，才进入逐条断开流程。
+  每个间隔最多关闭一条；新的业务连接由 Clash 原生负载均衡组自行补建和选择。
+- 停止服务会取消后续自动操作。守护进程不恢复连接，也不改变任何代理组选择。
+
+原“重建中转”批量操作已从出口卡片移除。控制台会根据当前策略组动态展示全部
+逻辑出口，并进入同一个 LuCI 管理页面。
+
+Mihomo 没有给单个 MUX 会话设置“停止接收新请求”的管理接口，也不提供原子的
+“仍然空闲才关闭”操作。因此这是保守的逐条断开，不保证所有长连接无感迁移：
+暂停中的会话仍可能重连，新请求可能继续复用旧 MUX。持续传输的旧隧道不会被
+强制清空，清理也可能长期等待。Provider 健康状态只能判断可达性，不能证明下载
+带宽更高；空闲或低流量本身不会把线路判为失效。
+
+配置在 `/etc/config/proxy_view_guard`，受 LuCI 登录保护的运行状态在
+`/var/run/proxy-view-guard/status.json`（目录仅 root 可访问）。API 密钥读取现有
+OpenClash 运行配置，通过 curl 标准输入传递，不写入额外文件或日志。软件包升级
+保留 UCI 配置；暂停或停止状态、计时和观察窗口不跨进程重启保存。
+
+手工停用自动巡检（服务仍保留只读发现状态，方便从页面重新配置）：
+
+```sh
+uci set proxy_view_guard.main.enabled='0'
+uci commit proxy_view_guard
+/etc/init.d/proxy-view-guard restart
+```
+
+通过 CLI 修改设置后需手工重启服务；通过 LuCI 保存会自动重启。新发现的出口
+默认不参与处理，建议先使用“只观察”，核对出口、线路探测和连接范围后再选择
+自动模式。
 
 ### GitHub Release 自动构建
 
@@ -126,6 +190,7 @@ npm run build      # 生成 dist/client
 npm run build:openclash # 生成可安装的 LuCI/OpenClash IPK
 npm start          # 提供已构建页面并自动打开浏览器
 npm run check      # TypeScript 和 lint 检查
+npm run test:guard # Provider 健康、传输保护、逐条退出与模拟控制器 API 测试（需 Ruby）
 ```
 
 ## API 数据来源

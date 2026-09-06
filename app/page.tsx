@@ -54,6 +54,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { MihomoClient, type MihomoProxy } from '@/lib/mihomo';
+import { GradualRoutingDialog } from '@/components/gradual-routing-dialog';
 
 const DEFAULT_ENDPOINT = 'http://192.168.8.1:9090';
 const ASIA_PATTERN = /(港|HK|Hong Kong|日本|东京|大阪|JP|Japan|台|台北|新北|彰化|TW|Taiwan|新加坡|坡|狮城|SG|Singapore)/;
@@ -90,7 +91,20 @@ type SavedConfig = {
 };
 
 type PreviousConnection = { upload: number; download: number };
-type ExitRegion = '日本' | '台湾';
+type LogicalExit = { id: string; label: string };
+
+function exitLabel(id: string) {
+  if (id.toLowerCase() === 'tw') return '台湾';
+  if (id.toLowerCase() === 'jp') return '日本';
+  return id;
+}
+
+function logicalExitIn(chains: string[]) {
+  for (const name of chains) {
+    const match = /(?:exit-node|代理隧道)\(([A-Za-z0-9_-]+)\)/i.exec(name);
+    if (match) return match[1];
+  }
+}
 
 function regionOf(name: string) {
   if (/(港|HK|Hong Kong)/.test(name)) return '香港';
@@ -134,12 +148,19 @@ function loadConfig(): SavedConfig {
     return { endpoint: DEFAULT_ENDPOINT, secret: '', rememberSecret: false };
   }
   const embedded = /^\/ui\/proxy-view(?:\/|$)/.test(window.location.pathname);
+  const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const bootstrapSecret = fragment.get('proxy-view-auth') ?? '';
+  if (bootstrapSecret) {
+    localStorage.setItem('mihomo:secret', bootstrapSecret);
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  }
+  const savedSecret = bootstrapSecret || localStorage.getItem('mihomo:secret') || '';
   return {
     endpoint: embedded
       ? window.location.origin
       : localStorage.getItem('mihomo:endpoint') || DEFAULT_ENDPOINT,
-    secret: localStorage.getItem('mihomo:secret') || '',
-    rememberSecret: Boolean(localStorage.getItem('mihomo:secret')),
+    secret: savedSecret,
+    rememberSecret: Boolean(savedSecret),
   };
 }
 
@@ -185,8 +206,7 @@ export default function Home() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [kickTarget, setKickTarget] = useState<NodeRow | null>(null);
   const [kicking, setKicking] = useState(false);
-  const [rebuildTarget, setRebuildTarget] = useState<ExitRegion | null>(null);
-  const [rebuildingRegion, setRebuildingRegion] = useState<ExitRegion | null>(null);
+  const [gradualExit, setGradualExit] = useState<LogicalExit | null>(null);
   const [notice, setNotice] = useState('');
   const previousConnections = useRef<Map<string, PreviousConnection>>(new Map());
   const previousTimestamp = useRef(0);
@@ -245,18 +265,16 @@ export default function Home() {
       const upRate = previous ? Math.max(connection.upload - previous.upload, 0) / elapsed : 0;
       const metadata = connection.metadata ?? {};
       const chainNames = [...(connection.chains ?? []), ...(connection.providerChains ?? [])];
-      const chainText = chainNames.join(' ');
       const nodeName = chainNames.find((name) => nodeNames.has(name));
       const isInner = metadata.type?.toLowerCase() === 'inner';
 
       if (!isInner) {
-        const route = /exit-node-tw|隧道\(tw\)|台湾出口/i.test(chainText)
-          ? '台湾出口'
-          : /exit-node-jp|隧道\(jp\)|日本出口/i.test(chainText)
-            ? '日本出口'
-            : chainNames.some((name) => name.toUpperCase() === 'DIRECT')
-              ? '直连'
-              : chainNames[0] || '其他出口';
+        const logical = logicalExitIn(chainNames);
+        const route = logical
+          ? `${exitLabel(logical)}出口`
+          : chainNames.some((name) => name.toUpperCase() === 'DIRECT')
+            ? '直连'
+            : chainNames[0] || '其他出口';
         const clientName = metadata.sourceIP
           || metadata.process
           || metadata.processPath?.split(/[\\/]/).at(-1)
@@ -278,12 +296,10 @@ export default function Home() {
       nextRates.set(nodeName, current);
 
       if (isInner) {
-        const endpointText = `${metadata.host ?? ''} ${metadata.destinationIP ?? ''} ${chainText}`;
-        const exit = /tw-server|隧道\(tw\)|台湾出口/i.test(endpointText)
-          ? '台湾出口 VM'
-          : /jp-server|隧道\(jp\)|日本出口/i.test(endpointText)
-            ? '日本出口 VM'
-            : metadata.host || metadata.destinationIP || '出口 VM';
+        const logical = logicalExitIn(chainNames);
+        const exit = logical
+          ? `${exitLabel(logical)}出口 VM`
+          : metadata.host || metadata.destinationIP || '出口 VM';
         nextTunnelFlows.push({ id: connection.id, line: nodeName, exit, downRate, upRate });
       }
     }
@@ -375,6 +391,10 @@ export default function Home() {
 
   const activeNodes = nodes.filter((node) => (rates.get(node.name)?.connectionIds.length ?? 0) > 0).length;
   const healthyNodes = nodes.filter((node) => node.alive).length;
+  const logicalExits = useMemo(() => groups.map((group) => {
+    const match = /^➡️ 代理隧道\(([A-Za-z0-9_-]+)\)$/.exec(group.name);
+    return match ? { id: match[1], label: exitLabel(match[1]), tunnel: group } : null;
+  }).filter((item): item is { id: string; label: string; tunnel: MihomoProxy } => Boolean(item)), [groups]);
 
   function saveSettings() {
     const next = { ...draft, endpoint: normalizeEndpoint(draft.endpoint) };
@@ -401,54 +421,6 @@ export default function Home() {
     }
   }
 
-  async function rebuildTunnel() {
-    if (!rebuildTarget) return;
-    const region = rebuildTarget;
-    const code = region === '日本' ? 'jp' : 'tw';
-    const serverPattern = region === '日本' ? /jp-server/i : /tw-server/i;
-    const tunnelName = `➡️ 代理隧道(${code})`;
-    const probeUrl = `http://${code}-server.aetherrootr.com/generate_204`;
-
-    setRebuildingRegion(region);
-    setError('');
-    setNotice('');
-    try {
-      const snapshot = await client.connections();
-      const outerConnections = (snapshot.connections ?? []).filter((connection) => {
-        const metadata = connection.metadata ?? {};
-        const endpoint = `${metadata.host ?? ''} ${metadata.destinationIP ?? ''}`;
-        return metadata.type?.toLowerCase() === 'inner' && serverPattern.test(endpoint);
-      });
-
-      const results = await Promise.allSettled(
-        outerConnections.map((connection) => client.closeConnection(connection.id)),
-      );
-      const closed = results.filter((result) => result.status === 'fulfilled').length;
-      const failed = results.length - closed;
-
-      await new Promise((resolve) => window.setTimeout(resolve, 500));
-      let probeFailed = false;
-      try {
-        await client.delay(tunnelName, probeUrl, 5000);
-      } catch {
-        probeFailed = true;
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 800));
-      previousConnections.current.clear();
-      previousTimestamp.current = 0;
-      await Promise.all([refreshTopology(), refreshConnections()]);
-
-      const details = outerConnections.length
-        ? `已关闭 ${closed} 条外层连接${failed ? `，${failed} 条已先行消失` : ''}`
-        : '未发现活动外层连接';
-      setNotice(`${region}中转已请求重建：${details}${probeFailed ? '；探测未完成，新业务流量仍会按需建链。' : '，并已触发线路探测。'}`);
-      setRebuildTarget(null);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : `${region}中转重建失败。`);
-    } finally {
-      setRebuildingRegion(null);
-    }
-  }
 
   return (
     <main className="min-h-screen bg-[#071019] text-slate-100">
@@ -478,11 +450,10 @@ export default function Home() {
         </section>
 
         <section className="mb-5 grid gap-3 lg:grid-cols-2" aria-label="出口策略状态">
-          {['日本', '台湾'].map((region) => {
-            const auto = groups.find((group) => group.name === `🔀 ${region}出口｜自动容灾`);
-            const tunnel = groups.find((group) => group.name === `➡️ 代理隧道(${region === '日本' ? 'jp' : 'tw'})`);
-            const exitRegion = region as ExitRegion;
-            return <article key={region} className="flex items-center justify-between gap-4 rounded-2xl border border-white/8 bg-gradient-to-r from-[#0d1b27] to-[#0a151f] px-4 py-3.5"><div className="flex min-w-0 items-center gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/5 text-lg">{region === '日本' ? '🇯🇵' : '🇹🇼'}</div><div className="min-w-0"><p className="text-sm font-medium">{region}出口</p><p className="truncate text-xs text-slate-500">隧道：{tunnel?.now ?? '等待连接'}</p></div></div><div className="flex items-center gap-3"><div className="text-right"><p className="text-sm text-cyan-200">{auto?.now ?? '—'}</p><p className="mt-0.5 text-xs text-slate-500">{auto?.alive === false ? '探测失败' : auto ? '探测正常' : '未发现策略组'}</p></div><Button variant="outline" size="sm" className="shrink-0 border-white/10 bg-white/4 text-slate-300 hover:bg-white/8" onClick={() => setRebuildTarget(exitRegion)} disabled={!connected || rebuildingRegion !== null}>{rebuildingRegion === exitRegion ? <LoaderCircle className="animate-spin" /> : <RefreshCw />}重建中转</Button></div></article>;
+          {logicalExits.map(({ id, label, tunnel }) => {
+            const auto = groups.find((group) => group.name.includes(`${label}出口｜自动容灾`));
+            const icon = id.toLowerCase() === 'jp' ? '🇯🇵' : id.toLowerCase() === 'tw' ? '🇹🇼' : '🌐';
+            return <article key={id} className="flex items-center justify-between gap-4 rounded-2xl border border-white/8 bg-gradient-to-r from-[#0d1b27] to-[#0a151f] px-4 py-3.5"><div className="flex min-w-0 items-center gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/5 text-lg">{icon}</div><div className="min-w-0"><p className="text-sm font-medium">{label}出口 <span className="font-mono text-xs text-slate-500">({id})</span></p><p className="truncate text-xs text-slate-500">隧道：{tunnel.now ?? '等待连接'}</p></div></div><div className="flex items-center gap-3"><div className="text-right"><p className="text-sm text-cyan-200">{auto?.now ?? '—'}</p><p className="mt-0.5 text-xs text-slate-500">{auto?.alive === false ? '探测失败' : auto ? '探测正常' : '未发现自动容灾组'}</p></div><Button variant="outline" size="sm" className="shrink-0 border-white/10 bg-white/4 text-slate-300 hover:bg-white/8" onClick={() => setGradualExit({ id, label })} disabled={!connected}><RefreshCw />管理换线</Button></div></article>;
           })}
         </section>
 
@@ -536,7 +507,7 @@ export default function Home() {
 
       <AlertDialog open={Boolean(kickTarget)} onOpenChange={(open) => !open && setKickTarget(null)}><AlertDialogContent className="border-white/10 bg-[#0c1823] text-slate-100"><AlertDialogHeader><AlertDialogMedia className="bg-rose-400/10 text-rose-300"><Unplug /></AlertDialogMedia><AlertDialogTitle>关闭这条线路的活动连接？</AlertDialogTitle><AlertDialogDescription className="text-slate-400"><span className="block break-all text-slate-200">{kickTarget?.name}</span><span className="mt-2 block">将关闭 {kickTarget?.connectionIds.length ?? 0} 条当前连接。应用可能立即重连，节点也不会从负载均衡池中永久移除。</span></AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={kicking}>取消</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={() => void kickConnections()} disabled={kicking}>{kicking ? <LoaderCircle className="animate-spin" /> : <Unplug />}确认关闭</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
 
-      <AlertDialog open={Boolean(rebuildTarget)} onOpenChange={(open) => !open && !rebuildingRegion && setRebuildTarget(null)}><AlertDialogContent className="border-white/10 bg-[#0c1823] text-slate-100"><AlertDialogHeader><AlertDialogMedia className="bg-cyan-400/10 text-cyan-300"><RefreshCw /></AlertDialogMedia><AlertDialogTitle>重建{rebuildTarget}中转？</AlertDialogTitle><AlertDialogDescription className="text-slate-400">将关闭{rebuildTarget}出口当前连接到出口 VM 的外层 MUX 隧道，并立即触发一次线路探测。相关业务会短暂断开后按需重连，另一个地区的出口不受影响。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={Boolean(rebuildingRegion)}>取消</AlertDialogCancel><AlertDialogAction onClick={() => void rebuildTunnel()} disabled={Boolean(rebuildingRegion)}>{rebuildingRegion ? <LoaderCircle className="animate-spin" /> : <RefreshCw />}确认重建</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
+      <GradualRoutingDialog logicalExit={gradualExit} endpoint={config.endpoint} onClose={() => setGradualExit(null)} />
     </main>
   );
 }

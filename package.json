@@ -1,6 +1,6 @@
 {
   "name": "proxy-view",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "private": true,
   "bin": {
     "proxy-view": "./bin/proxy-view.mjs"
@@ -14,7 +14,8 @@
     "build:openclash": "npm run build && node ./scripts/package-openclash.mjs",
     "start": "node ./bin/proxy-view.mjs",
     "dashboard": "npm run build && npm start",
-    "check": "tsc --noEmit && oxlint app lib components/traffic-flow-map.tsx bin/proxy-view.mjs scripts/*.mjs",
+    "check": "tsc --noEmit && oxlint app lib components/traffic-flow-map.tsx components/gradual-routing-dialog.tsx bin/proxy-view.mjs scripts/*.mjs tests/*.mjs",
+    "test:guard": "ruby tests/gradual_guard_test.rb && node --test tests/guard-client.test.mjs",
     "lint": "oxlint",
     "format": "oxfmt"
   },

@@ -114,6 +114,11 @@ Description: Mihomo dashboard with conservative native load-balancer connection 
   writeFileSync(join(controlRoot, 'conffiles'), '/etc/config/proxy_view_guard\n');
   writeFileSync(join(controlRoot, 'postinst'), `#!/bin/sh
 if [ -z "$IPKG_INSTROOT" ]; then
+  # A browser can cache FileServer's directory listing while opkg replaces
+  # the dashboard. Use install time rather than build time for revalidation.
+  if [ -f /usr/share/openclash/ui/proxy-view/index.html ]; then
+    touch /usr/share/openclash/ui/proxy-view/index.html
+  fi
   # Keep upgrades self-contained. Old releases stored node-selection settings
   # which are no longer used by the native load-balancer monitor.
   if ! uci -q get proxy_view_guard.main >/dev/null 2>&1; then

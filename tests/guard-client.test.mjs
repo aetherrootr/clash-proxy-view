@@ -34,6 +34,7 @@ test('router client authenticates, encodes provider names and limits deletes to 
     await writeFile(config, JSON.stringify({ secret }), { mode: 0o600 });
     const code = `require ARGV.shift
 c=ProxyViewGuard::Client.new(ARGV.shift,ARGV.shift)
+c.cache_credentials!
 c.line_delays('机场 / provider','香港 / A',500)
 c.exit_delays('⚡ 台湾出口｜多线加速',1500)
 c.connections

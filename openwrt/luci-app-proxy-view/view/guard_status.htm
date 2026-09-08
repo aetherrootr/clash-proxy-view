@@ -45,22 +45,36 @@
 </style>
 
 <h2><%:渐进换线%></h2>
-<p><%:守护进程观察订阅原有的“⚡ …出口｜多线加速”及 Clash Provider 健康状态。机场线路连续判为不可用且对应连接持续空闲后，每次只断开一条；新连接由 Clash 原生负载均衡自动选择。仍有字节增长的连接始终保留。%></p>
+<p><%:守护进程观察订阅原有的“⚡ …出口｜多线加速”及 Clash Provider 健康状态。机场线路连续判为不可用且对应连接持续空闲后，按设置的规则逐条退出；同时支持按出口立即踢掉全部中转连接并二次确认。新连接由 Clash 原生负载均衡自动选择。%></p>
 <div class="pv-card pv-row">
   <div><strong><%:守护服务%></strong><div id="pv-service" class="pv-muted"><%:正在读取状态…%></div></div>
   <label><input id="pv-global" type="checkbox"> <%:启用后台巡检%></label>
 </div>
 <div id="pv-error" class="alert-message error" style="display:none"></div>
+<div id="pv-result" class="pv-muted" role="status"></div>
 <div id="pv-exits"></div>
 
 <script type="text/javascript">
 (function(){
   var stateUrl='<%=luci.dispatcher.build_url("admin","services","proxy-view","guard-status")%>';
   var actionUrl='<%=luci.dispatcher.build_url("admin","services","proxy-view","guard-action")%>';
-  var root=document.getElementById('pv-exits'), last=null, saving=false, dirty=false, requests=[];
+  var root=document.getElementById('pv-exits'), last=null, saving=false, dirty=false, loading=false, requests=[], closedIds={}, receivedAt=0;
   var phases={monitoring:'巡检中',paused:'已暂停',bypassed:'已跳过：当前选择链未经过多线组',unavailable:'无法识别出口服务器'};
   function node(tag, cls, text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
   function showError(message){var e=document.getElementById('pv-error');e.textContent=message||'';e.style.display=message?'block':'none'}
+  function bytes(value){
+    if(typeof value!=='number'||!isFinite(value))return '—';
+    var units=['B','KiB','MiB','GiB'],i=0;
+    while(value>=1024&&i<units.length-1){value/=1024;i++}
+    return value.toFixed(i?1:0)+' '+units[i]
+  }
+  function freshness(){
+    if(!last)return;
+    var age=typeof last.sample_age==='number'?last.sample_age+(Date.now()-receivedAt)/1000:null;
+    document.getElementById('pv-service').textContent=(last.running?'运行中':'未运行或状态已过期')+' · 已发现 '+(last.exits||[]).length+' 个逻辑出口 · '+(age===null?'采样不可用':Math.floor(age)+' 秒前采样'+(age>6?'（数据延迟）':''));
+    root.querySelectorAll('[data-speed]').forEach(function(e){e.hidden=age===null||age>6});
+    root.querySelectorAll('[data-stale-speed]').forEach(function(e){e.hidden=age!==null&&age<=6});
+  }
   function pump(){
     if(saving||!requests.length)return;
     var job=requests.shift();saving=true;showError('');
@@ -68,16 +82,17 @@
       saving=false;
       var ok=Boolean(data&&data.ok);
       if(!ok)showError((data&&data.error)||'操作失败。');
-      if(job.done)job.done(ok);
+      if(job.done)job.done(ok,data);
       if(requests.length)pump();
-      else window.setTimeout(function(){dirty=false;load()},1500)
+      else window.setTimeout(function(){dirty=false;load()},/^kick/.test(job.payload.operation)?0:1500)
     });
   }
   function post(payload,done){requests.push({payload:payload,done:done});pump()}
   function inputField(grid,label,key,value,min,max){
     var box=node('div','pv-field'), lab=node('label','',label), input=node('input');
     input.type='number';input.name=key;input.value=value;input.min=min;input.max=max;
-    box.appendChild(lab);box.appendChild(input);grid.appendChild(box)
+    input.step=1;
+    box.appendChild(lab);box.appendChild(input);box.appendChild(node('small','pv-muted','允许范围：'+min+'–'+max+'，仅限整数'));grid.appendChild(box)
   }
   function renderExit(item){
     var card=node('section','pv-card'), head=node('div','pv-row'), title=node('div');
@@ -86,7 +101,29 @@
     head.appendChild(title);
     var actions=node('div','pv-actions'), saveTop=node('button','btn cbi-button cbi-button-apply','保存设置');
     var assess=node('button','btn cbi-button cbi-button-action','立即评估');
-    actions.appendChild(saveTop);assess.onclick=function(){post({operation:'assess',logical:item.id})};actions.appendChild(assess);head.appendChild(actions);card.appendChild(head);
+    var kickAll=node('button','btn cbi-button cbi-button-negative','立即踢掉全部连接');
+    kickAll.disabled=!item.endpoint;
+    kickAll.onclick=function(){
+      if(saving||requests.length)return;
+      if(!confirm('确认立即踢掉出口 '+item.id+'（'+item.group+'）的全部中转连接？')) return;
+      if(!confirm('再次确认：将立即中断该出口当前全部多线中转连接，包括正在传输的连接，不等待空闲保护。业务可能自动重连。')) return;
+      kickAll.disabled=true;
+      document.getElementById('pv-result').textContent='正在并发关闭 '+item.id+' 出口连接并核对结果…';
+      post({operation:'kick_all',logical:item.id},function(ok,data){
+        kickAll.disabled=false;
+        (data&&data.closed_ids||[]).forEach(function(id){closedIds[id]=true});
+        document.getElementById('pv-result').textContent=data&&typeof data.closed==='number'
+          ? item.id+'：匹配 '+data.matched+' 条，已确认断开 '+data.closed+' 条，剩余 '+data.remaining+' 条。业务自动重连产生的新连接不计入本次清理。'
+          : '关闭结果无法确认，请检查错误提示。';
+        if(last)render(last);
+      });
+    };
+    actions.appendChild(saveTop);
+    assess.onclick=function(){post({operation:'assess',logical:item.id})};
+    actions.appendChild(assess);
+    actions.appendChild(kickAll);
+    head.appendChild(actions);
+    card.appendChild(head);
     if(!item.attached)card.appendChild(node('div','alert-message warning',item.tunnel_group+' 的当前选择链没有经过 '+item.group+'。该出口不会自动断开连接，处理方式已经保存为“只观察”。'));
 
     var settings=item.settings||{}, grid=node('div','pv-grid');
@@ -99,11 +136,14 @@
     inputField(grid,'空闲保护（秒）','idle_seconds',settings.idle_seconds||120,120,86400);
     inputField(grid,'检查间隔（秒）','check_interval',settings.check_interval||60,15,3600);
     inputField(grid,'连续失败轮数','failure_rounds',settings.failure_rounds||3,1,20);
-    inputField(grid,'逐条退出间隔（秒）','retire_interval',settings.retire_interval||60,30,3600);
+    inputField(grid,'逐条退出间隔（秒）','retire_interval',settings.retire_interval||60,10,3600);
     card.appendChild(grid);
+    card.appendChild(node('p','pv-muted','自动退出间隔最小 10 秒，默认 60 秒；空闲保护最少 120 秒。后台目标每 2 秒采样，页面每 2 秒刷新；请求耗时可能使执行稍晚。线路健康仍按检查间隔读取 Provider 状态。手动踢掉全部连接不受这些限制，最多 16 个关闭请求并发执行。'));
 
     var saveTimer=null, pendingSaves=0, savedTimer=null;
     function save(){
+      var invalid=Array.prototype.find.call(grid.querySelectorAll('input[type=number]'),function(e){return !e.value||!e.checkValidity()});
+      if(invalid){invalid.reportValidity();return}
       dirty=true;
       pendingSaves+=1;saveTop.disabled=true;saveTop.textContent='正在保存…';
       var payload={operation:'save',logical:item.id,settings:{enabled:enabledInput.checked,mode:mode.value}};
@@ -131,37 +171,75 @@
     var saveButton=node('button','btn cbi-button cbi-button-apply','保存此出口设置');saveButton.onclick=save;card.appendChild(saveButton);
     card.appendChild(node('p','pv-muted','本插件不新增代理组、不主动探测节点、不指定机场节点，也不修改 Clash 的选路。它复用 Provider 已维护的 alive 与延迟历史；逐条断开后，只有新的业务请求需要连接时，Clash 才会按订阅原有多线组补建连接。'));
 
+    card.appendChild(renderTelemetry(item));return card
+  }
+  function renderTelemetry(item){
+    var card=node('div'), settings=item.settings||{};
+    card.setAttribute('data-telemetry',item.id);
+    card.appendChild(node('p','pv-muted','估算速度 = 相邻有效采样的字节增量 ÷ 实际时间。首次采样、计数重置或采样中断时等待重新采样；数据超过 6 秒未更新时隐藏速度。流量为当前连接累计值。'));
     var table=node('table','pv-table'), tr=node('tr');
-    ['机场线路','线路探测','流量','空闲观察','保护状态','手动操作'].forEach(function(v){tr.appendChild(node('th','',v))});table.appendChild(tr);
+    ['机场线路','线路探测','累计流量','估算速度 / 采样增量','空闲观察','保护状态','手动管理'].forEach(function(v){tr.appendChild(node('th','',v))});table.appendChild(tr);
     (item.tunnels||[]).forEach(function(tunnel){
       var row=node('tr');row.appendChild(node('td','',tunnel.line||'未知'));
       var probe=tunnel.probeable===false?'同名节点来源不唯一，仅观察':(tunnel.line_delays||[]).map(function(value){return value==null?'超时':value+' ms'}).join(' / ')||'等待探测';
       if(Number(tunnel.line_failures||0)>0)probe+=' · 连续失败 '+tunnel.line_failures+' 轮';
       row.appendChild(node('td',Number(tunnel.line_failures||0)>0?'pv-warn':'pv-ok',probe));
-      row.appendChild(node('td','',String(tunnel.download||0)+' ↓ / '+String(tunnel.upload||0)+' ↑'));
+      row.appendChild(node('td','',bytes(tunnel.download||0)+' ↓ / '+bytes(tunnel.upload||0)+' ↑'));
+      var speed=node('td'), live=node('div'), stale=node('div','pv-warn','数据延迟，等待新采样');
+      live.setAttribute('data-speed','');stale.setAttribute('data-stale-speed','');
+      if(typeof tunnel.sample_seconds==='number'&&tunnel.sample_seconds>0){
+        live.appendChild(node('div','', '↓ '+bytes(tunnel.download_rate)+'/s · ↑ '+bytes(tunnel.upload_rate)+'/s'));
+        live.appendChild(node('small','pv-muted','近 '+tunnel.sample_seconds.toFixed(1)+' 秒：↓ '+bytes(tunnel.download_delta)+' / ↑ '+bytes(tunnel.upload_delta)));
+      }else live.textContent='等待有效采样';
+      speed.appendChild(live);speed.appendChild(stale);row.appendChild(speed);
       row.appendChild(node('td','',String(tunnel.idle_seconds||0)+' 秒'));
       var reason=tunnel.protection_reason, protection='持续空闲';
       if(reason==='transferring')protection='正在传输，受保护';
       else if(reason==='observing')protection='观察中，还需 '+Math.max(0,Number(settings.idle_seconds||120)-Number(tunnel.idle_seconds||0))+' 秒';
       else if(reason===undefined&&tunnel.protected)protection='仍在保护期';
       row.appendChild(node('td',tunnel.protected?'pv-ok':'pv-warn',protection));
-      var cell=node('td'), kick=node('button','btn cbi-button cbi-button-negative','强制踢掉');
-      kick.onclick=function(){if(confirm('这会立即中断该连接。确认强制踢掉 '+(tunnel.line||tunnel.id)+'？'))post({operation:'kick',logical:item.id,connection:tunnel.id})};
-      cell.appendChild(kick);row.appendChild(cell);table.appendChild(row)
+      var action=node('td'), kick=node('button','btn cbi-button cbi-button-negative','踢掉此连接');
+      kick.type='button';kick.disabled=saving||!item.endpoint;
+      kick.title='仅断开本行连接，不会禁用节点或断开同名节点的其他连接';
+      kick.onclick=function(){
+        if(saving||requests.length)return;
+        if(!confirm('确认踢掉出口 '+item.id+' 的这条连接？\n线路：'+(tunnel.line||'未知')+'\n连接 ID：'+tunnel.id))return;
+        if(!confirm('再次确认：立即断开此连接，包括正在传输的流量，不等待空闲保护。业务可能自动重连；节点不会被禁用。'))return;
+        kick.disabled=true;
+        document.getElementById('pv-result').textContent='正在关闭 '+(tunnel.line||tunnel.id)+' 的这条连接…';
+        post({operation:'kick',logical:item.id,connection:tunnel.id},function(ok){
+          kick.disabled=false;
+          if(ok)closedIds[tunnel.id]=true;
+          document.getElementById('pv-result').textContent=ok?'已关闭 '+(tunnel.line||tunnel.id)+' 的这条连接；后续新连接不受影响。':'未能确认关闭，请检查错误提示。';
+          if(last)render(last);
+        });
+      };
+      action.appendChild(kick);row.appendChild(action);
+      table.appendChild(row)
     });
-    if(!(item.tunnels||[]).length){var empty=node('tr'), cell=node('td','pv-empty','当前没有匹配到该出口的多线连接。');cell.colSpan=6;empty.appendChild(cell);table.appendChild(empty)}
+    if(!(item.tunnels||[]).length){var empty=node('tr'), cell=node('td','pv-empty','当前没有匹配到该出口的多线连接。');cell.colSpan=7;empty.appendChild(cell);table.appendChild(empty)}
     card.appendChild(table);
     var events=node('details'), summary=node('summary','','最近处理记录'), pre=node('pre');
     pre.style.whiteSpace='pre-wrap';pre.textContent=(item.events||[]).map(function(e){return new Date(e.time*1000).toLocaleTimeString()+' '+e.message}).join('\n');
     events.appendChild(summary);events.appendChild(pre);card.appendChild(events);return card
   }
   function render(data){
-    last=data;var global=document.getElementById('pv-global');global.checked=Boolean(data.enabled);
-    document.getElementById('pv-service').textContent=data.running?'运行中 · 已发现 '+(data.exits||[]).length+' 个逻辑出口':'未运行、正在重启或状态已过期';
+    (data.exits||[]).forEach(function(item){item.tunnels=(item.tunnels||[]).filter(function(tunnel){return !closedIds[tunnel.id]})});
+    last=data;
+    var editing=dirty||saving||root.contains(document.activeElement);
+    if(editing){
+      root.querySelectorAll('[data-telemetry]').forEach(function(old){
+        var item=(data.exits||[]).find(function(e){return e.id===old.getAttribute('data-telemetry')});
+        if(item)old.parentNode.replaceChild(renderTelemetry(item),old);
+      });
+      freshness();return;
+    }
+    var global=document.getElementById('pv-global');global.checked=Boolean(data.enabled);
     root.innerHTML='';(data.exits||[]).forEach(function(item){root.appendChild(renderExit(item))});
     if(!(data.exits||[]).length)root.appendChild(node('div','pv-card pv-empty','没有发现完整的 exit-node(<id>)、➡️ 代理隧道(<id>) 与订阅原生 ⚡ …出口｜多线加速。'))
+    freshness();
   }
-  function load(){if(saving||dirty)return;XHR.get(stateUrl,null,function(xhr,data){if(data&&!dirty)render(data)})}
+  function load(){if(loading||document.hidden)return;loading=true;XHR.get(stateUrl,null,function(xhr,data){loading=false;if(data&&Array.isArray(data.exits)){receivedAt=Date.now();render(data)}else freshness()})}
   var globalTimer=null, globalInput=document.getElementById('pv-global');
   function saveGlobal(){
     dirty=true;
@@ -169,7 +247,8 @@
     globalTimer=window.setTimeout(function(){globalTimer=null;post({operation:'global',enabled:globalInput.checked})},50)
   }
   globalInput.oninput=saveGlobal;globalInput.onchange=saveGlobal;
-  load();window.setInterval(load,5000)
+  document.addEventListener('visibilitychange',function(){if(!document.hidden)load()});
+  load();window.setInterval(load,2000);window.setInterval(freshness,1000)
 })();
 </script>
 <%+footer%>

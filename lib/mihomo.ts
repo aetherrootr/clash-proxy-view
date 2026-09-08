@@ -108,18 +108,6 @@ export class MihomoClient {
     return this.request<ConnectionSnapshot>('/connections');
   }
 
-  closeConnection(id: string) {
-    return this.request<void>(`/connections/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    });
-  }
-
-  async closeConnections(ids: string[]) {
-    const results = await Promise.allSettled(ids.map((id) => this.closeConnection(id)));
-    const failed = results.filter((result) => result.status === 'rejected').length;
-    if (failed) throw new Error(`${failed} 条连接关闭失败，请刷新后重试。`);
-  }
-
   delay(proxyName: string, url: string, timeout = 5000) {
     const query = new URLSearchParams({ url, timeout: String(timeout) });
     return this.request<{ delay: number }>(

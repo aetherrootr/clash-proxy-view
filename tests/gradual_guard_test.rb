@@ -86,12 +86,74 @@ other=tunnel('other',LINE,0,'jp-server.example.test','⚡ 日本出口｜多线�
 client=tunnel('client'); client['metadata']['type']='Socks5'
 tracker.sample([tunnel('tw'),other,client],0)
 check(tracker.entries.keys==['tw'] && tracker.entries['tw'][:line]==LINE,'tracker must match the logical group and extract its leaf line')
+check(tracker.entries['tw'][:upload_rate].nil?,'first sample must not imply zero speed')
+sample=tunnel('tw',LINE,1024); sample['download']=4096
+tracker.sample([sample],2)
+entry=tracker.entries['tw']
+check(entry[:upload_rate]==512 && entry[:download_rate]==2048 && entry[:download_delta]==4096 && entry[:sample_seconds]==2,
+  'rates must use byte deltas and actual elapsed time')
+tracker.sample([sample],5)
+check(tracker.entries['tw'][:download_rate]==0,'valid idle sample must report zero speed')
+tracker.sample([tunnel('tw')],7)
+check(tracker.entries['tw'][:download_rate].nil?,'counter reset must invalidate speed')
+tracker.sample([sample],30)
+check(tracker.entries['tw'][:download_rate].nil?,'sampling gap must invalidate speed')
+sample['start']='new-session'; tracker.sample([sample],32)
+check(tracker.entries['tw'][:download_rate].nil?,'reused connection ID must not inherit old byte counters')
+tracker.sample([sample],32)
+check(tracker.entries['tw'][:download_rate].nil?,'zero elapsed time must not divide by zero')
 api=FakeClient.new([tunnel('manual')]); ProxyViewGuard.safe_kick(api,[SPEC],'tw','manual')
 check(api.closed==['manual'],'manual kick must validate the logical exit')
 begin
   ProxyViewGuard.safe_kick(FakeClient.new([other]),[SPEC],'tw','other'); raise 'unsafe kick was accepted'
 rescue ArgumentError
 end
+
+api=FakeClient.new([tunnel('active',LINE,100),tunnel('idle'),other,client])
+check(ProxyViewGuard.safe_kick_all(api,[SPEC],'tw')['closed']==2,'bulk kick must report all successful closes')
+check(api.closed.sort==['active','idle'],'bulk kick must immediately close active and idle tunnels, preserving other exits and clients')
+api=FakeClient.new([tunnel('failed'),tunnel('success')])
+api.define_singleton_method(:close) do |id|
+  raise ProxyViewGuard::ApiError if id=='failed'
+  @closed << id
+  @list.reject! { |connection| connection['id']==id }
+end
+result=ProxyViewGuard.safe_kick_all(api,[SPEC],'tw')
+check(!result['ok'] && result['closed']==1 && result['remaining']==1,'partial failure must be reported accurately')
+check(api.closed==['success'],'bulk kick must attempt remaining connections after a failure')
+missing_endpoint=SPEC.dup; missing_endpoint.endpoint=nil
+api=FakeClient.new([tunnel('unknown',LINE,0,'')])
+begin
+  ProxyViewGuard.safe_kick_all(api,[missing_endpoint],'tw'); raise 'unknown endpoint was accepted'
+rescue ArgumentError
+end
+check(api.closed.empty?,'missing endpoint must never match empty connection hosts')
+check(ProxyViewGuard.safe_kick_all(FakeClient.new([other]),[SPEC],'tw')['matched']==0,'empty snapshot must be a harmless no-op')
+
+# Every close must start before any close is allowed to finish.
+api=FakeClient.new([tunnel('parallel1'),tunnel('parallel2')])
+started=Queue.new; release=Queue.new
+api.define_singleton_method(:close) do |id|
+  started << id; release.pop
+  @list.reject! { |connection| connection['id']==id }
+end
+require 'timeout'
+job=Thread.new { ProxyViewGuard.safe_kick_all(api,[SPEC],'tw') }
+begin
+  Timeout.timeout(3) { 2.times { started.pop } }
+ensure
+  2.times { release << true }
+end
+check(job.value['closed']==2,'parallel close must verify both original IDs disappeared')
+
+api=FakeClient.new([tunnel('ten1'),tunnel('ten2')])
+guard=ProxyViewGuard::Engine.new(api,SPEC,{'enabled'=>true,'mode'=>'auto','idle_seconds'=>120,'failure_rounds'=>1,'retire_interval'=>10})
+ticks(guard,0,120)
+check(api.closed.size==1,'first eligible connection must retire')
+guard.tick(125)
+check(api.closed.size==1,'10-second interval must not retire after only 5 seconds')
+guard.tick(130)
+check(api.closed.size==2,'10-second interval must allow the next retirement')
 
 discovery_api=Object.new
 def discovery_api.proxies
@@ -107,6 +169,21 @@ check(specs.map(&:id)==['tw'] && specs.first.group==GROUP,'discovery must use th
 check(specs.first.eligible==[LINE],'discovery must omit subscription metadata entries')
 
 payload={'unicode'=>'台湾','quoted'=>"a\"\\\n\t",'nested'=>[true,false,nil,1,1.25]}
+require 'tmpdir'
+shared=ProxyViewGuard::Client.new('/unused'); provider_reads=0
+shared.define_singleton_method(:request) { |_path| provider_reads+=1; {'providers'=>{}} }
+shared.share_providers { 2.times { shared.providers } }
+check(provider_reads==1,'exits must share one Provider snapshot per cycle')
+shared.share_providers { shared.providers }
+check(provider_reads==2,'next cycle must refresh Provider data')
+Dir.mktmpdir('proxy-view-secret-test-') do |directory|
+  path=File.join(directory,'config.yaml')
+  File.write(path,"secret: first\n")
+  cached=ProxyViewGuard::Client.new(path)
+  check(cached.current_secret=='first','credentials must be read initially')
+  File.write(path,"secret: replacement\n")
+  check(cached.current_secret=='replacement','changed config must invalidate cached credentials')
+end
 check(YAML.safe_load(ProxyViewGuard.json(payload))==payload,'status JSON must be valid')
 check(ProxyViewGuard::Client.new('/unused').encode('a /')=='a%20%2F','API paths must be encoded')
 puts 'PASS: native multi-line discovery, Provider health, active-transfer protection, gradual disconnect, ownership gate, manual kick and encoding'

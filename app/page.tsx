@@ -12,23 +12,10 @@ import {
   RefreshCw,
   Search,
   Settings2,
-  Unplug,
   Wifi,
   WifiOff,
   X,
 } from 'lucide-react';
-
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogMedia,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import {
   TrafficFlowMap,
@@ -54,6 +41,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { MihomoClient, type MihomoProxy } from '@/lib/mihomo';
+import { exitIn, isExitName } from '@/lib/logical-exits';
 import { GradualRoutingDialog } from '@/components/gradual-routing-dialog';
 
 const DEFAULT_ENDPOINT = 'http://192.168.8.1:9090';
@@ -68,7 +56,6 @@ type BaseNode = {
 };
 
 type NodeRow = BaseNode & {
-  connectionIds: string[];
   connections: number;
   downRate: number;
   upRate: number;
@@ -91,21 +78,6 @@ type SavedConfig = {
 };
 
 type PreviousConnection = { upload: number; download: number };
-type LogicalExit = { id: string; label: string };
-
-function exitLabel(id: string) {
-  if (id.toLowerCase() === 'tw') return '台湾';
-  if (id.toLowerCase() === 'jp') return '日本';
-  return id;
-}
-
-function logicalExitIn(chains: string[]) {
-  for (const name of chains) {
-    const match = /(?:exit-node|代理隧道)\(([A-Za-z0-9_-]+)\)/i.exec(name);
-    if (match) return match[1];
-  }
-}
-
 function regionOf(name: string) {
   if (/(港|HK|Hong Kong)/.test(name)) return '香港';
   if (/(台|台北|新北|彰化|TW|Taiwan)/.test(name)) return '台湾';
@@ -204,9 +176,7 @@ export default function Home() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [regionFilter, setRegionFilter] = useState('all');
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [kickTarget, setKickTarget] = useState<NodeRow | null>(null);
-  const [kicking, setKicking] = useState(false);
-  const [gradualExit, setGradualExit] = useState<LogicalExit | null>(null);
+  const [routingOpen, setRoutingOpen] = useState(false);
   const [notice, setNotice] = useState('');
   const previousConnections = useRef<Map<string, PreviousConnection>>(new Map());
   const previousTimestamp = useRef(0);
@@ -244,7 +214,8 @@ export default function Home() {
     }
 
     setNodes([...new Map(nextNodes.map((node) => [node.name, node])).values()]);
-    setGroups(proxyValues.filter((proxy) => proxy.name.includes('出口｜') || proxy.name.startsWith('➡️ 代理隧道')));
+    const providerProxies = Object.values(providerData.providers ?? {}).flatMap((provider) => provider.proxies ?? []);
+    setGroups([...new Map([...providerProxies, ...proxyValues].map((proxy) => [proxy.name, proxy])).values()]);
   }, [client]);
 
   const refreshConnections = useCallback(async () => {
@@ -269,9 +240,9 @@ export default function Home() {
       const isInner = metadata.type?.toLowerCase() === 'inner';
 
       if (!isInner) {
-        const logical = logicalExitIn(chainNames);
+        const logical = exitIn(chainNames, groups);
         const route = logical
-          ? `${exitLabel(logical)}出口`
+          ? logical
           : chainNames.some((name) => name.toUpperCase() === 'DIRECT')
             ? '直连'
             : chainNames[0] || '其他出口';
@@ -296,9 +267,9 @@ export default function Home() {
       nextRates.set(nodeName, current);
 
       if (isInner) {
-        const logical = logicalExitIn(chainNames);
+        const logical = exitIn(chainNames, groups);
         const exit = logical
-          ? `${exitLabel(logical)}出口 VM`
+          ? logical
           : metadata.host || metadata.destinationIP || '出口 VM';
         nextTunnelFlows.push({ id: connection.id, line: nodeName, exit, downRate, upRate });
       }
@@ -315,7 +286,7 @@ export default function Home() {
       connections: connections.length,
     });
     setLastUpdated(new Date());
-  }, [client, nodes]);
+  }, [client, nodes, groups]);
 
   const connect = useCallback(async () => {
     setConnecting(true);
@@ -369,7 +340,6 @@ export default function Home() {
       return {
         ...node,
         latency: node.latency,
-        connectionIds: activity?.connectionIds ?? [],
         connections: activity?.connectionIds.length ?? 0,
         downRate: activity?.downRate ?? 0,
         upRate: activity?.upRate ?? 0,
@@ -391,10 +361,23 @@ export default function Home() {
 
   const activeNodes = nodes.filter((node) => (rates.get(node.name)?.connectionIds.length ?? 0) > 0).length;
   const healthyNodes = nodes.filter((node) => node.alive).length;
-  const logicalExits = useMemo(() => groups.map((group) => {
-    const match = /^➡️ 代理隧道\(([A-Za-z0-9_-]+)\)$/.exec(group.name);
-    return match ? { id: match[1], label: exitLabel(match[1]), tunnel: group } : null;
-  }).filter((item): item is { id: string; label: string; tunnel: MihomoProxy } => Boolean(item)), [groups]);
+  const logicalExits = useMemo(() => {
+    const proxies = new Map(groups.map((group) => [group.name, group]));
+    return groups.filter((proxy) => isExitName(proxy.name)).sort((a,b) => a.name.localeCompare(b.name)).map((proxy) => {
+      const leaf = exitIn([proxy.name], groups);
+      const id = leaf?.replace(/^exit-node-/, '');
+      const tunnel = id ? proxies.get(`➡️ 代理隧道(${id})`) : undefined;
+      const route: string[] = [];
+      const seen = new Set<string>();
+      let current = tunnel;
+      while (current?.now && !seen.has(current.name)) {
+        seen.add(current.name);
+        route.push(current.now);
+        current = proxies.get(current.now);
+      }
+      return { name: proxy.name, isGroup: Boolean(proxy.all), selected: proxy.now, candidates: proxy.all ?? [], tunnel, route };
+    });
+  }, [groups]);
 
   function saveSettings() {
     const next = { ...draft, endpoint: normalizeEndpoint(draft.endpoint) };
@@ -407,21 +390,6 @@ export default function Home() {
     setSettingsOpen(false);
   }
 
-  async function kickConnections() {
-    if (!kickTarget) return;
-    setKicking(true);
-    try {
-      await client.closeConnections(kickTarget.connectionIds);
-      setKickTarget(null);
-      await refreshConnections();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '关闭连接失败。');
-    } finally {
-      setKicking(false);
-    }
-  }
-
-
   return (
     <main className="min-h-screen bg-[#071019] text-slate-100">
       <div className="mx-auto flex min-h-screen max-w-[1600px] flex-col px-4 pb-10 pt-4 sm:px-6 lg:px-8">
@@ -431,6 +399,7 @@ export default function Home() {
             <div><h1 className="text-lg font-semibold tracking-tight">多线代理控制台</h1><p className="text-sm text-slate-500">节点健康、实时传输与连接处置</p></div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" className="border-white/10 bg-white/4 text-slate-200 hover:bg-white/8" onClick={() => setRoutingOpen(true)} disabled={!connected}><RefreshCw />管理换线</Button>
             <span className={`inline-flex h-8 items-center gap-2 rounded-lg border px-3 text-sm ${connected ? 'border-emerald-400/20 bg-emerald-400/8 text-emerald-300' : 'border-white/10 bg-white/4 text-slate-400'}`}><span className={`size-2 rounded-full ${connected ? 'bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,.7)]' : 'bg-slate-600'}`} />{connected ? version : '未连接'}</span>
             <Button variant="outline" className="border-white/10 bg-white/4 text-slate-200 hover:bg-white/8" onClick={() => void connect()} disabled={connecting}>{connecting ? <LoaderCircle className="animate-spin" /> : <PlugZap />}{connected ? '重新连接' : '连接 API'}</Button>
             <Button variant="outline" size="icon" className="border-white/10 bg-white/4 text-slate-200 hover:bg-white/8" aria-label="连接设置" onClick={() => { setDraft(config); setSettingsOpen(true); }}><Settings2 /></Button>
@@ -449,12 +418,26 @@ export default function Home() {
           ].map((item) => <article key={item.label} className="relative overflow-hidden rounded-2xl border border-white/8 bg-[#0c1823] p-4 shadow-[0_14px_40px_rgba(0,0,0,.16)]"><div className="flex items-center justify-between"><p className="text-sm text-slate-400">{item.label}</p><item.icon className={`size-4 ${item.color}`} /></div><p className="mt-3 font-mono text-2xl font-semibold tracking-tight text-white">{item.value}</p><p className="mt-1 text-xs text-slate-500">{item.meta}</p></article>)}
         </section>
 
-        <section className="mb-5 grid gap-3 lg:grid-cols-2" aria-label="出口策略状态">
-          {logicalExits.map(({ id, label, tunnel }) => {
-            const auto = groups.find((group) => group.name.includes(`${label}出口｜自动容灾`));
-            const icon = id.toLowerCase() === 'jp' ? '🇯🇵' : id.toLowerCase() === 'tw' ? '🇹🇼' : '🌐';
-            return <article key={id} className="flex items-center justify-between gap-4 rounded-2xl border border-white/8 bg-gradient-to-r from-[#0d1b27] to-[#0a151f] px-4 py-3.5"><div className="flex min-w-0 items-center gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/5 text-lg">{icon}</div><div className="min-w-0"><p className="text-sm font-medium">{label}出口 <span className="font-mono text-xs text-slate-500">({id})</span></p><p className="truncate text-xs text-slate-500">隧道：{tunnel.now ?? '等待连接'}</p></div></div><div className="flex items-center gap-3"><div className="text-right"><p className="text-sm text-cyan-200">{auto?.now ?? '—'}</p><p className="mt-0.5 text-xs text-slate-500">{auto?.alive === false ? '探测失败' : auto ? '探测正常' : '未发现自动容灾组'}</p></div><Button variant="outline" size="sm" className="shrink-0 border-white/10 bg-white/4 text-slate-300 hover:bg-white/8" onClick={() => setGradualExit({ id, label })} disabled={!connected}><RefreshCw />管理换线</Button></div></article>;
-          })}
+        <section className="mb-5 overflow-hidden rounded-2xl border border-white/8 bg-[#0c1823]" aria-label="逻辑出口列表">
+          <div className="flex items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
+            <h2 className="text-sm font-medium">出口节点与选择组 <span className="ml-2 font-mono text-xs text-slate-500">{logicalExits.filter((item) => !item.isGroup).length} 个节点 · {logicalExits.filter((item) => item.isGroup).length} 个选择组</span></h2>
+            <span className="text-xs text-slate-500">包含 Provider 中未使用的出口 · 上下滚动查看</span>
+          </div>
+          <section className="max-h-64 overflow-y-auto overscroll-contain" aria-label="可滚动的全部逻辑出口">
+            {logicalExits.length === 0 ? <p className="px-4 py-6 text-center text-sm text-slate-500">{connected ? '当前配置未发现逻辑出口。' : '连接 API 后显示全部逻辑出口。'}</p> : <ul className="divide-y divide-white/6">
+              {logicalExits.map(({ name, isGroup, selected, candidates, tunnel, route }) => <li key={name} className="grid gap-3 px-4 py-3.5 sm:grid-cols-[220px_minmax(0,1fr)]">
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/5"><Cable className="size-4" /></div>
+                  <div className="min-w-0"><p className="break-words font-mono text-sm font-medium">{name}</p><p className="mt-1 text-xs text-slate-500">{isGroup ? '选择组' : '出口节点'}</p></div>
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <p className="break-words text-sm text-cyan-200">{isGroup ? `当前选择：${selected ?? '尚未选择'}` : `原始节点：${name}`}</p>
+                  {isGroup && <p className="break-words text-xs leading-5 text-slate-400">全部候选：{candidates.join(' · ') || '无'}</p>}
+                  <p className="break-words text-xs leading-5 text-slate-400">中转路径：{route.join(' → ') || (tunnel ? '尚未选择' : '未配置代理隧道')}</p>
+                </div>
+              </li>)}
+            </ul>}
+          </section>
         </section>
 
         <TrafficFlowMap
@@ -475,8 +458,8 @@ export default function Home() {
         <section className="flex min-h-[520px] flex-1 flex-col overflow-hidden rounded-2xl border border-white/8 bg-[#0a151f] shadow-[0_22px_70px_rgba(0,0,0,.22)]">
           <div className="flex flex-col gap-3 border-b border-white/8 p-4 lg:flex-row lg:items-center lg:justify-between"><div><h2 className="font-medium">亚洲中转线路</h2><p className="mt-1 text-xs text-slate-500">速度来自活动连接的字节增量；空闲不代表线路故障。</p></div><div className="flex flex-col gap-2 sm:flex-row"><div className="relative min-w-60"><Search className="pointer-events-none absolute left-2.5 top-2.5 size-4 text-slate-600" /><Input aria-label="搜索节点或机场" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索节点或机场" className="border-white/10 bg-black/15 pl-9 text-slate-200 placeholder:text-slate-600" /></div><select value={regionFilter} onChange={(event) => setRegionFilter(event.target.value)} className="h-8 rounded-lg border border-white/10 bg-[#0d1b27] px-2.5 text-sm text-slate-300 outline-none focus:border-cyan-400/50" aria-label="地区筛选"><option value="all">全部地区</option><option>香港</option><option>台湾</option><option>新加坡</option><option>日本</option></select><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="h-8 rounded-lg border border-white/10 bg-[#0d1b27] px-2.5 text-sm text-slate-300 outline-none focus:border-cyan-400/50" aria-label="状态筛选"><option value="all">全部状态</option><option value="active">传输中</option><option value="idle">空闲</option><option value="dead">故障</option></select><Button variant="outline" size="icon" aria-label="刷新" className="border-white/10 bg-white/4 text-slate-300 hover:bg-white/8" onClick={() => void Promise.all([refreshTopology(), refreshConnections()])} disabled={!connected}><RefreshCw /></Button></div></div>
 
-          <div className="min-h-0 flex-1 overflow-auto"><Table><TableHeader className="sticky top-0 z-10 bg-[#0b1721]/95 backdrop-blur"><TableRow className="border-white/8 hover:bg-transparent"><TableHead className="min-w-72 text-slate-500">线路</TableHead><TableHead className="text-slate-500">状态</TableHead><TableHead className="text-right text-slate-500">延迟</TableHead><TableHead className="text-right text-slate-500">连接</TableHead><TableHead className="min-w-36 text-right text-slate-500">实时速度</TableHead><TableHead className="text-right text-slate-500">活动流量</TableHead><TableHead className="text-right text-slate-500">操作</TableHead></TableRow></TableHeader><TableBody>
-            {!connected ? <TableRow className="border-0 hover:bg-transparent"><TableCell colSpan={7} className="h-80 text-center"><div className="mx-auto flex max-w-sm flex-col items-center"><WifiOff className="size-9 text-slate-700" /><p className="mt-4 font-medium text-slate-300">连接本地 Mihomo API</p><p className="mt-2 text-sm leading-6 text-slate-500">配置控制器地址和密钥后，这里会显示每条亚洲中转线路的健康、延迟和实时速度。</p><Button className="mt-5 bg-cyan-300 text-slate-950 hover:bg-cyan-200" onClick={() => setSettingsOpen(true)}><Settings2 />配置连接</Button></div></TableCell></TableRow> : rows.length === 0 ? <TableRow className="border-0 hover:bg-transparent"><TableCell colSpan={7} className="h-80 text-center text-slate-500">当前筛选条件下没有线路。</TableCell></TableRow> : rows.map((row) => <TableRow key={row.name} className="border-white/6 hover:bg-white/[.025]"><TableCell><div className="flex items-center gap-3"><div className="grid size-8 shrink-0 place-items-center rounded-lg border border-white/8 bg-white/4 text-xs font-semibold text-slate-300">{row.region.slice(0, 1)}</div><div className="min-w-0"><p className="max-w-[420px] truncate text-sm text-slate-200" title={row.name}>{row.name}</p><p className="mt-1 text-xs text-slate-600">{row.provider} · {row.region}</p></div></div></TableCell><TableCell><StatusPill alive={row.alive} active={row.connections > 0} /></TableCell><TableCell className="text-right font-mono text-sm"><span className={!row.alive ? 'text-rose-300' : row.latency && row.latency < 150 ? 'text-emerald-300' : 'text-amber-300'}>{row.latency ? `${row.latency} ms` : '—'}</span></TableCell><TableCell className="text-right font-mono text-sm text-slate-300">{row.connections}</TableCell><TableCell className="text-right"><p className="font-mono text-sm text-sky-300">↓ {formatRate(row.downRate)}</p><p className="mt-1 font-mono text-xs text-violet-300/80">↑ {formatRate(row.upRate)}</p></TableCell><TableCell className="text-right font-mono text-xs text-slate-500">{formatBytes(row.download + row.upload)}</TableCell><TableCell><div className="flex justify-end"><Button variant="destructive" size="sm" onClick={() => setKickTarget(row)} disabled={!row.connectionIds.length}><Unplug />踢掉连接</Button></div></TableCell></TableRow>)}
+          <div className="min-h-0 flex-1 overflow-auto"><Table><TableHeader className="sticky top-0 z-10 bg-[#0b1721]/95 backdrop-blur"><TableRow className="border-white/8 hover:bg-transparent"><TableHead className="min-w-72 text-slate-500">线路</TableHead><TableHead className="text-slate-500">状态</TableHead><TableHead className="text-right text-slate-500">延迟</TableHead><TableHead className="text-right text-slate-500">连接</TableHead><TableHead className="min-w-36 text-right text-slate-500">实时速度</TableHead><TableHead className="text-right text-slate-500">活动流量</TableHead></TableRow></TableHeader><TableBody>
+            {!connected ? <TableRow className="border-0 hover:bg-transparent"><TableCell colSpan={6} className="h-80 text-center"><div className="mx-auto flex max-w-sm flex-col items-center"><WifiOff className="size-9 text-slate-700" /><p className="mt-4 font-medium text-slate-300">连接本地 Mihomo API</p><p className="mt-2 text-sm leading-6 text-slate-500">配置控制器地址和密钥后，这里会显示每条亚洲中转线路的健康、延迟和实时速度。</p><Button className="mt-5 bg-cyan-300 text-slate-950 hover:bg-cyan-200" onClick={() => setSettingsOpen(true)}><Settings2 />配置连接</Button></div></TableCell></TableRow> : rows.length === 0 ? <TableRow className="border-0 hover:bg-transparent"><TableCell colSpan={6} className="h-80 text-center text-slate-500">当前筛选条件下没有线路。</TableCell></TableRow> : rows.map((row) => <TableRow key={row.name} className="border-white/6 hover:bg-white/[.025]"><TableCell><div className="flex items-center gap-3"><div className="grid size-8 shrink-0 place-items-center rounded-lg border border-white/8 bg-white/4 text-xs font-semibold text-slate-300">{row.region.slice(0, 1)}</div><div className="min-w-0"><p className="max-w-[420px] truncate text-sm text-slate-200" title={row.name}>{row.name}</p><p className="mt-1 text-xs text-slate-600">{row.provider} · {row.region}</p></div></div></TableCell><TableCell><StatusPill alive={row.alive} active={row.connections > 0} /></TableCell><TableCell className="text-right font-mono text-sm"><span className={!row.alive ? 'text-rose-300' : row.latency && row.latency < 150 ? 'text-emerald-300' : 'text-amber-300'}>{row.latency ? `${row.latency} ms` : '—'}</span></TableCell><TableCell className="text-right font-mono text-sm text-slate-300">{row.connections}</TableCell><TableCell className="text-right"><p className="font-mono text-sm text-sky-300">↓ {formatRate(row.downRate)}</p><p className="mt-1 font-mono text-xs text-violet-300/80">↑ {formatRate(row.upRate)}</p></TableCell><TableCell className="text-right font-mono text-xs text-slate-500">{formatBytes(row.download + row.upload)}</TableCell></TableRow>)}
           </TableBody></Table></div>
         </section>
 
@@ -505,9 +488,7 @@ export default function Home() {
         </DialogContent>
       </Dialog>
 
-      <AlertDialog open={Boolean(kickTarget)} onOpenChange={(open) => !open && setKickTarget(null)}><AlertDialogContent className="border-white/10 bg-[#0c1823] text-slate-100"><AlertDialogHeader><AlertDialogMedia className="bg-rose-400/10 text-rose-300"><Unplug /></AlertDialogMedia><AlertDialogTitle>关闭这条线路的活动连接？</AlertDialogTitle><AlertDialogDescription className="text-slate-400"><span className="block break-all text-slate-200">{kickTarget?.name}</span><span className="mt-2 block">将关闭 {kickTarget?.connectionIds.length ?? 0} 条当前连接。应用可能立即重连，节点也不会从负载均衡池中永久移除。</span></AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={kicking}>取消</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={() => void kickConnections()} disabled={kicking}>{kicking ? <LoaderCircle className="animate-spin" /> : <Unplug />}确认关闭</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
-
-      <GradualRoutingDialog logicalExit={gradualExit} endpoint={config.endpoint} onClose={() => setGradualExit(null)} />
+      <GradualRoutingDialog open={routingOpen} endpoint={config.endpoint} onClose={() => setRoutingOpen(false)} />
     </main>
   );
 }

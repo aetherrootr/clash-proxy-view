@@ -50,6 +50,7 @@ function guard_status()
   local data = current_status()
   local age = os.time() - (tonumber(data.updated_at) or 0)
   data.running = age >= 0 and age < 90
+  data.sample_age = data.sampled_at and math.max(0, os.time() - data.sampled_at) or nil
   local global_enabled = uci:get("proxy_view_guard", "main", "enabled")
   if global_enabled then data.enabled = global_enabled == "1" end
   local numeric = {
@@ -118,7 +119,7 @@ function guard_action()
     local settings = payload.settings or {}
     local ranges = {
       idle_seconds={120,86400}, check_interval={15,3600}, failure_rounds={1,20},
-      retire_interval={30,3600}
+      retire_interval={10,3600}
     }
     local clean = {}
     for key, range in pairs(ranges) do
@@ -142,6 +143,18 @@ function guard_action()
     local path = "/var/run/proxy-view-guard/command-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000)) .. ".yaml"
     fs.writefile(path, "action: assess\nlogical: " .. logical .. "\n")
     return reply({ ok = true })
+  end
+
+  if operation == "kick_all" then
+    local util = require "luci.util"
+    local command = "/usr/bin/ruby /usr/share/proxy-view/guard.rb --kick-all "
+      .. util.shellquote(logical) .. " 2>/dev/null"
+    local result = json.parse(require("luci.sys").exec(command) or "")
+    if type(result) ~= "table" then
+      return reply({ error = "无法验证关闭结果，请刷新检查；部分连接可能已关闭。" }, 409)
+    end
+    if not result.ok then result.error = "仍有 " .. tostring(result.remaining) .. " 条原连接未关闭。" end
+    return reply(result, result.ok and 200 or 409)
   end
 
   if operation == "kick" then

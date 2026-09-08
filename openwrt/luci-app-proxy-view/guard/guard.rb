@@ -34,11 +34,23 @@ module ProxyViewGuard
     def initialize(config_path, endpoint = 'http://127.0.0.1:9090')
       @config_path, @endpoint = config_path, endpoint
     end
+    def cache_credentials!
+      @secret = YAML.load_file(@config_path).fetch('secret').to_s
+    end
+    def current_secret
+      stat = File.stat(@config_path)
+      signature = [stat.ino, stat.size, stat.mtime, stat.ctime]
+      if @config_signature != signature
+        @config_secret = YAML.load_file(@config_path).fetch('secret').to_s
+        @config_signature = signature
+      end
+      @config_secret
+    end
     def encode(value)
       value.to_s.bytes.map { |b| (b.between?(48,57) || b.between?(65,90) || b.between?(97,122) || [45,46,95,126].include?(b)) ? b.chr : '%%%02X' % b }.join
     end
     def request(path, method = 'GET', body = nil)
-      secret = YAML.load_file(@config_path).fetch('secret').to_s
+      secret = @secret || current_secret
       raise ApiError, 'Invalid secret' if secret.empty? || secret.match?(/[\r\n]/)
       escaped = secret.gsub(/([\\"])/) { |c| '\\' + c }
       args = ['curl','-s','--fail','--connect-timeout','2','--max-time','7','--config','-','-X',method]
@@ -54,7 +66,19 @@ module ProxyViewGuard
     end
     def connections; request('/connections').fetch('connections'); end
     def proxies; request('/proxies').fetch('proxies'); end
-    def providers; request('/providers/proxies').fetch('providers'); end
+    def providers
+      return @provider_snapshot if @provider_snapshot
+      result = request('/providers/proxies').fetch('providers')
+      @provider_snapshot = result if @sharing_providers
+      result
+    end
+    def share_providers
+      @sharing_providers = true
+      yield
+    ensure
+      @sharing_providers = false
+      @provider_snapshot = nil
+    end
     def group(name); request('/proxies/' + encode(name)); end
     def close(id); request('/connections/' + encode(id), 'DELETE'); end
     def delay(name, url, timeout)
@@ -98,10 +122,10 @@ module ProxyViewGuard
     rescue StandardError
       nil
     end
-    def call
+    def call(manual: false)
       proxy_map = @api.proxies
       owners = {}
-      @api.providers.each do |provider_name, provider|
+      (manual ? {} : @api.providers).each do |provider_name, provider|
         Array(provider['proxies']).each { |proxy| (owners[proxy['name'].to_s] ||= []) << provider_name }
       end
       specs = []
@@ -152,9 +176,16 @@ module ProxyViewGuard
         uninterrupted = old && now >= old[:seen] && now - old[:seen] <= 20 && old[:start] == connection['start']
         same = uninterrupted && old[:upload] == connection['upload'] && old[:download] == connection['download']
         growing = uninterrupted && (connection['upload'] > old[:upload] || connection['download'] > old[:download])
+        interval = old ? now - old[:seen] : 0
+        valid_rate = uninterrupted && interval > 0 && connection['upload'] >= old[:upload] && connection['download'] >= old[:download]
         next_entries[connection['id']] = {
           id:connection['id'], start:connection['start'], upload:connection['upload'], download:connection['download'],
           seen:now, last_change:same ? old[:last_change] : now, growing:growing,
+          sample_seconds:valid_rate ? interval : nil,
+          upload_delta:valid_rate ? connection['upload'] - old[:upload] : nil,
+          download_delta:valid_rate ? connection['download'] - old[:download] : nil,
+          upload_rate:valid_rate ? (connection['upload'] - old[:upload]) / interval.to_f : nil,
+          download_rate:valid_rate ? (connection['download'] - old[:download]) / interval.to_f : nil,
           chains:Array(connection['chains']), line:line_for(connection)
         }
       end
@@ -270,6 +301,8 @@ module ProxyViewGuard
           idle_seconds = [now-entry[:last_change],0].max.to_i
           reason = entry[:growing] ? 'transferring' : (idle_seconds < @config['idle_seconds'] ? 'observing' : 'idle')
           {'id'=>entry[:id], 'line'=>entry[:line], 'upload'=>entry[:upload], 'download'=>entry[:download],
+           'sample_seconds'=>entry[:sample_seconds], 'upload_delta'=>entry[:upload_delta], 'download_delta'=>entry[:download_delta],
+           'upload_rate'=>entry[:upload_rate], 'download_rate'=>entry[:download_rate],
            'idle_seconds'=>idle_seconds, 'protection_reason'=>reason, 'protected'=>reason != 'idle',
            'line_failures'=>@line_failures.fetch(entry[:line],0), 'line_delays'=>@line_delays[entry[:line]],
            'probeable'=>@spec.owners.fetch(entry[:line],[]).length == 1}
@@ -288,18 +321,30 @@ module ProxyViewGuard
       end
     end
     def command(action, id); @engines[id]&.request_assessment if action == 'assess'; end
+    def refresh_telemetry
+      snapshot = @api.connections
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      @sampled_at = Time.now.to_i
+      @engines.each_value { |engine| engine.tracker.sample(snapshot, now) }
+    rescue StandardError
+      @sampled_at = nil
+      @engines.each_value { |engine| engine.tracker.reset }
+    end
     def tick(now)
       snapshot = @api.connections
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      @sampled_at = Time.now.to_i
       if @global['enabled']
         @engines.each_value { |engine| engine.tick(now, snapshot) }
       else
         @engines.each_value { |engine| engine.tracker.sample(snapshot, now) }
       end
     rescue StandardError
+      @sampled_at = nil
       @engines.each_value { |engine| engine.tracker.reset }
     end
     def status(now)
-      {'updated_at'=>Time.now.to_i, 'enabled'=>@global['enabled'], 'exits'=>@engines.values.map { |engine| engine.status(now) }}
+      {'updated_at'=>Time.now.to_i, 'sampled_at'=>@sampled_at, 'enabled'=>@global['enabled'], 'exits'=>@engines.values.map { |engine| engine.status(now) }}
     end
   end
 
@@ -325,7 +370,7 @@ module ProxyViewGuard
         'idle_seconds'=>integer(section['idle_seconds'],120,120,86400),
         'check_interval'=>integer(section['check_interval'],60,15,3600),
         'failure_rounds'=>integer(section['failure_rounds'],3,1,20),
-        'retire_interval'=>integer(section['retire_interval'],60,30,3600)
+        'retire_interval'=>integer(section['retire_interval'],60,10,3600)
       }
     end
     {'mihomo_config'=>active, 'global'=>global, 'exits'=>exits}
@@ -333,10 +378,44 @@ module ProxyViewGuard
   def self.safe_kick(api, specs, logical, connection_id)
     spec = specs.find { |item| item.id == logical }
     raise ArgumentError, 'Unknown logical exit' unless spec && connection_id.match?(/\A[A-Za-z0-9._:-]{1,128}\z/)
+    raise ArgumentError, 'Unknown exit endpoint' if spec.endpoint.to_s.empty?
     tracker = Tracker.new(spec.group, spec.endpoint)
     connection = api.connections.find { |item| item['id'] == connection_id }
     raise ArgumentError, 'Connection is outside this logical exit' unless connection && tracker.outer?(connection)
     api.close(connection_id)
+  end
+
+  def self.safe_kick_all(api, specs, logical)
+    spec = specs.find { |item| item.id == logical }
+    raise ArgumentError, 'Unknown logical exit' unless spec
+    raise ArgumentError, 'Unknown exit endpoint' if spec.endpoint.to_s.empty?
+    tracker = Tracker.new(spec.group, spec.endpoint)
+    ids = api.connections.select { |connection| tracker.outer?(connection) }
+      .map { |connection| connection['id'].to_s }
+      .select { |id| id.match?(%r{\A[A-Za-z0-9._:-]{1,128}\z}) }.uniq
+    queue = Queue.new
+    ids.each { |id| queue << id }
+    workers = [ids.size, 16].min.times.map do
+      Thread.new do
+        loop do
+          begin
+            id = queue.pop(true)
+          rescue ThreadError
+            break
+          end
+          begin
+            api.close(id)
+          rescue ApiError
+            # A timed-out request may still have closed the connection.
+            # The fresh snapshot below determines the actual result.
+          end
+        end
+      end
+    end
+    workers.each(&:value)
+    remaining = api.connections.map { |connection| connection['id'].to_s } & ids
+    {'ok'=>remaining.empty?, 'matched'=>ids.size, 'closed'=>ids.size-remaining.size,
+     'remaining'=>remaining.size, 'closed_ids'=>ids-remaining}
   end
 end
 
@@ -350,9 +429,14 @@ if $PROGRAM_NAME == __FILE__
     print secret; exit 0
   end
   api = ProxyViewGuard::Client.new(config.fetch('mihomo_config'))
-  specs = ProxyViewGuard::Discovery.new(api, config.fetch('mihomo_config')).call
+  manual = %w[--kick --kick-all].include?(ARGV[0])
+  api.cache_credentials! if manual
+  specs = ProxyViewGuard::Discovery.new(api, config.fetch('mihomo_config')).call(manual: manual)
   if ARGV[0] == '--kick'
     ProxyViewGuard.safe_kick(api, specs, ARGV.fetch(1), ARGV.fetch(2)); exit 0
+  end
+  if ARGV[0] == '--kick-all'
+    puts ProxyViewGuard.json(ProxyViewGuard.safe_kick_all(api, specs, ARGV.fetch(1))); exit 0
   end
   File.open(ProxyViewGuard::RUN_DIR + '/lock', File::RDWR | File::CREAT,0o600) do |lock|
     exit 0 unless lock.flock(File::LOCK_EX | File::LOCK_NB)
@@ -377,10 +461,14 @@ if $PROGRAM_NAME == __FILE__
         File.unlink(path) rescue nil
       end
       now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      manager.tick(now)
-      ProxyViewGuard.atomic_write(ProxyViewGuard::RUN_DIR + '/status.json', ProxyViewGuard.json(manager.status(now)))
+      api.share_providers { manager.tick(now) }
+      manager.refresh_telemetry if Process.clock_gettime(Process::CLOCK_MONOTONIC) - now > 2
+      ProxyViewGuard.atomic_write(ProxyViewGuard::RUN_DIR + '/status.json', ProxyViewGuard.json(manager.status(Process.clock_gettime(Process::CLOCK_MONOTONIC))))
       break if ARGV.include?('--once')
-      5.times { break if stopped; sleep 1 }
+      deadline = now + 2
+      until stopped || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        sleep [[deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC), 0.2].max, 1].min
+      end
     end
   end
 end

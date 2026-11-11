@@ -1,6 +1,6 @@
 {
   "name": "proxy-view",
-  "version": "0.4.0",
+  "version": "0.5.1",
   "private": true,
   "bin": {
     "proxy-view": "./bin/proxy-view.mjs"
@@ -15,7 +15,7 @@
     "start": "node ./bin/proxy-view.mjs",
     "dashboard": "npm run build && npm start",
     "check": "tsc --noEmit && oxlint app lib components/traffic-flow-map.tsx components/gradual-routing-dialog.tsx bin/proxy-view.mjs scripts/*.mjs tests/*.mjs",
-    "test:guard": "ruby tests/gradual_guard_test.rb && node --experimental-strip-types --test tests/*.test.mjs",
+    "test:guard": "ruby tests/gradual_guard_test.rb && ruby tests/health_advice_test.rb && node --experimental-strip-types --test tests/*.test.mjs",
     "lint": "oxlint",
     "format": "oxfmt"
   },

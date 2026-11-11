@@ -54,7 +54,8 @@ function guard_status()
   local global_enabled = uci:get("proxy_view_guard", "main", "enabled")
   if global_enabled then data.enabled = global_enabled == "1" end
   local numeric = {
-    "idle_seconds", "check_interval", "failure_rounds", "retire_interval"
+    "idle_seconds", "check_interval", "failure_rounds", "retire_interval",
+    "advice_delay_ms", "advice_ratio", "health_max_age"
   }
   for _, item in ipairs(data.exits or {}) do
     local section = "exit_" .. tostring(item.id or "")
@@ -119,7 +120,8 @@ function guard_action()
     local settings = payload.settings or {}
     local ranges = {
       idle_seconds={120,86400}, check_interval={15,3600}, failure_rounds={1,20},
-      retire_interval={10,3600}
+      retire_interval={10,3600}, advice_delay_ms={100,10000},
+      advice_ratio={2,10}, health_max_age={60,3600}
     }
     local clean = {}
     for key, range in pairs(ranges) do

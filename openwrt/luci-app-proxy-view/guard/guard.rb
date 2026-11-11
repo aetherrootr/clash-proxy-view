@@ -5,7 +5,8 @@ module ProxyViewGuard
   RUN_DIR = '/var/run/proxy-view-guard'
   DEFAULTS = {
     'enabled'=>false, 'mode'=>'observe', 'idle_seconds'=>120, 'check_interval'=>60,
-    'failure_rounds'=>3, 'retire_interval'=>60
+    'failure_rounds'=>3, 'retire_interval'=>60,
+    'advice_delay_ms'=>800, 'advice_ratio'=>3, 'health_max_age'=>900
   }.freeze
   PROBE_URLS = ['https://cp.cloudflare.com/generate_204','https://www.gstatic.com/generate_204'].freeze
 
@@ -99,7 +100,86 @@ module ProxyViewGuard
     def exit_delays(name, timeout); PROBE_URLS.map { |url| delay(name, url, timeout) }; end
   end
 
-  ExitSpec = Struct.new(:id, :selector, :tunnel_group, :group, :endpoint, :eligible, :owners, keyword_init: true)
+  ExitSpec = Struct.new(:id, :selector, :tunnel_group, :group, :endpoint, :eligible, :owners, :probe_url, keyword_init: true)
+
+  # Provider top-level alive/history may mix unrelated test URLs. Only dated,
+  # fresh evidence for this exit is allowed to affect advice or idle cleanup.
+  class HealthEvidence
+    def initialize; @history, @url = {}, nil; end
+    def timestamp(value)
+      match = /\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)(Z|[+-]\d{2}:\d{2})\z/.match(value.to_s)
+      return nil unless match
+      Time.new(*match.captures.first(5).map(&:to_i), match[6].to_f, match[7] == 'Z' ? '+00:00' : match[7]).to_f
+    rescue ArgumentError, RangeError
+      nil
+    end
+    def median(values)
+      sorted = values.sort
+      return nil if sorted.empty?
+      (sorted[(sorted.length-1)/2] + sorted[sorted.length/2]) / 2.0
+    end
+    def read(name, node, url, now, max_age)
+      scoped = node.is_a?(Hash) && node['extra'].is_a?(Hash) && node['extra'][url]
+      result = {'name'=>name, 'state'=>'unknown', 'reason'=>'missing_probe', 'samples'=>[], 'failures'=>0}
+      unless scoped.is_a?(Hash)
+        @history.delete(name)
+        return result
+      end
+      incoming = Array(scoped['history']).map do |sample|
+        next unless sample.is_a?(Hash)
+        time, delay = timestamp(sample['time']), sample['delay']
+        next unless time && time <= now && delay.is_a?(Numeric) && delay.finite? && delay >= 0
+        {'time'=>sample['time'], 'timestamp'=>time, 'delay'=>delay}
+      end
+      incoming.compact!
+      fresh = incoming.select { |sample| now-sample['timestamp'] <= max_age }
+      if fresh.empty?
+        @history.delete(name)
+        result['reason'] = incoming.empty? ? 'missing_samples' : 'stale'
+        return result
+      end
+      # Re-reading a cached Provider response never creates another failure round.
+      merged = (Array(@history[name]) + fresh).to_h { |sample| [sample['timestamp'], sample] }.values
+      samples = merged.select { |sample| now-sample['timestamp'] <= max_age }.sort_by { |sample| sample['timestamp'] }.last(20)
+      @history[name] = samples
+      result['samples'] = samples.map { |sample| sample.reject { |key,_| key == 'timestamp' } }
+      result['sampled_at'] = samples.last['timestamp']
+      result['state'] = samples.last['delay'] > 0 ? 'healthy' : 'failed'
+      result['reason'] = result['state']
+      result['failures'] = samples.reverse.take_while { |sample| sample['delay'] == 0 }.size
+      recent = samples.last(3)
+      result['median_ms'] = median(recent.map { |sample| sample['delay'] }) if recent.all? { |sample| sample['delay'] > 0 }
+      result
+    end
+    def assess(nodes, url, now, config)
+      @history.clear if @url != url
+      @url = url
+      @history.delete_if { |name,_| !nodes.key?(name) }
+      lines = nodes.map { |name,node| [name,read(name,node,url,now,config['health_max_age'])] }.to_h
+      baseline = median(lines.values.map { |line| line['median_ms'] if line['state'] == 'healthy' }.compact)
+      threshold = [config['advice_delay_ms'], baseline.to_f * config['advice_ratio']].max
+      alternatives = lines.values.count { |line| line['state'] == 'healthy' && line['median_ms'] && line['median_ms'] < threshold }
+      recommendations = lines.values.map do |line|
+        slow_rounds = line['samples'].reverse.take_while { |sample| sample['delay'] >= threshold }.size
+        rounds = line['state'] == 'failed' ? line['failures'] : slow_rounds
+        next if rounds == 0
+        ready = rounds >= config['failure_rounds']
+        line.merge('kind'=>line['state'] == 'failed' ? 'unreachable' : 'high_latency',
+          'recommendation'=>ready ? 'consider_isolation' : 'watch', 'rounds'=>rounds,
+          'required_rounds'=>config['failure_rounds'], 'threshold_ms'=>threshold,
+          'alternative_count'=>alternatives, 'probe_url'=>url,
+          'samples'=>line['samples'].last(config['failure_rounds']))
+      end
+      recommendations.compact!
+      recommendations.sort_by! { |line| [line['recommendation'] == 'consider_isolation' ? 0 : 1, -line['rounds'], line['name']] }
+      {'lines'=>lines, 'recommendations'=>recommendations,
+        'summary'=>{'candidate_count'=>nodes.size, 'healthy'=>lines.values.count { |line| line['state'] == 'healthy' },
+          'failed'=>lines.values.count { |line| line['state'] == 'failed' },
+          'unknown'=>lines.values.count { |line| line['state'] == 'unknown' },
+          'baseline_ms'=>baseline, 'threshold_ms'=>threshold, 'probe_url'=>url,
+          'assessed_at'=>now, 'max_age_seconds'=>config['health_max_age']}}
+    end
+  end
 
   class Discovery
     def initialize(api, mihomo_config = nil); @api, @mihomo_config = api, mihomo_config; end
@@ -143,7 +223,8 @@ module ProxyViewGuard
         group = groups.first
         eligible = Array(proxy_map[group]['all']).map(&:to_s).reject { |node| metadata_name?(node) || owners.fetch(node, []).length != 1 }
         specs << ExitSpec.new(id:id, selector:name, tunnel_group:tunnel_name, group:group,
-          endpoint:endpoint_for(selector['now'].to_s), eligible:eligible, owners:owners)
+          endpoint:endpoint_for(selector['now'].to_s), eligible:eligible, owners:owners,
+          probe_url:proxy_map[group]['testUrl'])
       end
       specs.sort_by(&:id)
     end
@@ -202,6 +283,8 @@ module ProxyViewGuard
       @phase, @events, @retired = spec.endpoint ? 'monitoring' : 'unavailable', [], 0
       @last_probe = @last_retire = nil
       @assessment_requested, @line_failures, @line_delays, @attached = false, {}, {}, true
+      @health = HealthEvidence.new
+      @line_health, @recommendations, @health_summary = {}, [], {}
     end
     def event(message)
       @events << {'time'=>Time.now.to_i,'message'=>message}; @events.shift while @events.length > 30
@@ -225,25 +308,30 @@ module ProxyViewGuard
       event('代理隧道的当前选择链已离开原生多线组；该出口已跳过，并切回只观察。')
     end
     def probe_lines
-      lines = @tracker.entries.values.map { |entry| entry[:line] }.reject(&:empty?).uniq
-      @line_failures.delete_if { |line,_| !lines.include?(line) }
-      @line_delays.delete_if { |line,_| !lines.include?(line) }
       providers = @api.providers
-      lines.each do |line|
-        break if @cancelled.call
-        line_owners = @spec.owners.fetch(line, [])
-        unless line_owners.length == 1
-          @line_delays[line], @line_failures[line] = [], 0
-          next
-        end
-        provider = providers[line_owners.first] || {}
-        node = Array(provider['proxies']).find { |item| item['name'].to_s == line }
-        values = Array(node && node['history']).last(2).map { |item| item['delay'].to_i }.select { |delay| delay > 0 }
-        @line_delays[line] = values
-        healthy = node && (node['alive'] == true || (node['alive'].nil? && values.any?))
-        @line_failures[line] = healthy ? 0 : @line_failures.fetch(line, 0) + 1
-      end
       group = @api.group(@spec.group)
+      url = group['testUrl'].to_s
+      url = @spec.probe_url.to_s if url.empty?
+      url = 'http://' + @spec.endpoint.to_s + '/generate_204' if url.empty? && @spec.endpoint
+      # Discover the current full candidate pool, including nodes with no open
+      # tunnels. Names duplicated across providers remain unknown, not failures.
+      owners, index = {}, {}
+      providers.each do |provider_name, provider|
+        Array(provider['proxies']).each do |node|
+          name = node['name'].to_s
+          (owners[name] ||= []) << provider_name
+          index[name] = node
+        end
+      end
+      discovery = Discovery.new(@api)
+      lines = Array(group['all'] || @spec.eligible).map(&:to_s).reject { |name| discovery.metadata_name?(name) }
+      lines |= @tracker.entries.values.map { |entry| entry[:line] }.reject(&:empty?)
+      @current_owners = owners
+      nodes = lines.to_h { |name| [name,owners.fetch(name, []).size == 1 ? index[name] : nil] }
+      assessment = @health.assess(nodes, url, Time.now.to_f, @config)
+      @line_health, @recommendations, @health_summary = assessment.values_at('lines','recommendations','summary')
+      @line_failures = @line_health.transform_values { |line| line['failures'] }
+      @line_delays = @line_health.transform_values { |line| line['samples'].last(2).map { |sample| sample['delay'] > 0 ? sample['delay'] : nil } }
       @group_delays = Array(group['history']).last(2).map { |item| item['delay'].to_i }.select { |delay| delay > 0 }
     end
     def retire_one(now)
@@ -251,6 +339,7 @@ module ProxyViewGuard
       return if @last_retire && now - @last_retire < @config['retire_interval']
       candidates = @tracker.entries.values.select do |entry|
         @line_failures.fetch(entry[:line], 0) >= @config['failure_rounds'] &&
+          Time.now.to_f - @line_health.fetch(entry[:line], {}).fetch('sampled_at', 0) <= @config['health_max_age'] &&
           now - entry[:last_change] >= @config['idle_seconds']
       end
       idle = candidates.min_by { |entry| entry[:last_change] }
@@ -296,6 +385,7 @@ module ProxyViewGuard
         'endpoint'=>@spec.endpoint, 'eligible'=>@spec.eligible, 'settings'=>settings, 'enabled'=>@config['enabled'],
         'phase'=>@phase, 'attached'=>@attached, 'selected'=>@spec.group, 'target'=>nil, 'retired'=>@retired,
         'delays'=>@group_delays, 'bad_rounds'=>@line_failures.values.max.to_i, 'events'=>@events,
+        'health_summary'=>@health_summary, 'recommendations'=>@recommendations,
         'lines'=>@line_failures.map { |line, failures| {'name'=>line,'failures'=>failures,'delays'=>@line_delays[line]} },
         'tunnels'=>@tracker.entries.values.map do |entry|
           idle_seconds = [now-entry[:last_change],0].max.to_i
@@ -305,7 +395,9 @@ module ProxyViewGuard
            'upload_rate'=>entry[:upload_rate], 'download_rate'=>entry[:download_rate],
            'idle_seconds'=>idle_seconds, 'protection_reason'=>reason, 'protected'=>reason != 'idle',
            'line_failures'=>@line_failures.fetch(entry[:line],0), 'line_delays'=>@line_delays[entry[:line]],
-           'probeable'=>@spec.owners.fetch(entry[:line],[]).length == 1}
+           'health_state'=>@line_health.fetch(entry[:line], {})['state'],
+           'health_reason'=>@line_health.fetch(entry[:line], {})['reason'],
+           'probeable'=>(@current_owners || @spec.owners).fetch(entry[:line],[]).length == 1}
         end
       }
     end
@@ -370,7 +462,10 @@ module ProxyViewGuard
         'idle_seconds'=>integer(section['idle_seconds'],120,120,86400),
         'check_interval'=>integer(section['check_interval'],60,15,3600),
         'failure_rounds'=>integer(section['failure_rounds'],3,1,20),
-        'retire_interval'=>integer(section['retire_interval'],60,10,3600)
+        'retire_interval'=>integer(section['retire_interval'],60,10,3600),
+        'advice_delay_ms'=>integer(section['advice_delay_ms'],800,100,10000),
+        'advice_ratio'=>integer(section['advice_ratio'],3,2,10),
+        'health_max_age'=>integer(section['health_max_age'],900,60,3600)
       }
     end
     {'mihomo_config'=>active, 'global'=>global, 'exits'=>exits}

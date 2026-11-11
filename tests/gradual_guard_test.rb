@@ -15,21 +15,24 @@ def tunnel(id, line=LINE, upload=0, host=HOST, group=GROUP)
 end
 
 class FakeClient
-  attr_accessor :list, :route, :provider_alive, :provider_delays, :fail_delete
+  attr_accessor :list, :route, :provider_alive, :provider_delays, :fail_delete, :scoped_samples
   attr_reader :closed, :probed
   def initialize(list)
     @list, @route = list, {TUNNEL=>FALLBACK,FALLBACK=>GROUP}
     @provider_alive, @provider_delays, @closed, @probed = false, [], [], []
   end
   def group(name)
-    return {'now'=>'','history'=>[{'delay'=>80},{'delay'=>90}]} if name == GROUP
+    return {'now'=>'','history'=>[{'delay'=>80},{'delay'=>90}], 'testUrl'=>"http://#{HOST}/generate_204"} if name == GROUP
     {'now'=>@route.fetch(name,'')}
   end
   def connections; Marshal.load(Marshal.dump(@list)); end
   def providers
     @probed << LINE
+    delays = @provider_alive ? @provider_delays : [0,0]
+    samples = @scoped_samples || delays.each_with_index.map { |delay,i| {'delay'=>delay,'time'=>Time.at(Time.now.to_i-60*(delays.size-1-i)).utc.strftime('%Y-%m-%dT%H:%M:%SZ')} }
     {'airport'=>{'proxies'=>[{'name'=>LINE,'alive'=>@provider_alive,
-      'history'=>@provider_delays.map { |delay| {'delay'=>delay} }}]}}
+      'history'=>@provider_delays.map { |delay| {'delay'=>delay} },
+      'extra'=>{"http://#{HOST}/generate_204"=>{'alive'=>@provider_alive,'history'=>samples}}}]}}
   end
   def close(id)
     raise ProxyViewGuard::ApiError if @fail_delete
@@ -59,7 +62,7 @@ check(api.closed==['idle1','idle2'],'a later interval may retire one more idle c
 api=FakeClient.new([tunnel('working')]); api.provider_alive=true; api.provider_delays=[60]; guard=engine(api); ticks(guard,0,300)
 check(api.closed.empty?,'one successful line probe must keep the line')
 api=FakeClient.new([tunnel('stale')]); api.provider_alive=false; api.provider_delays=[60]; guard=engine(api); guard.tick(0)
-check(guard.status(0)['tunnels'][0]['line_failures']==1,'current alive=false must override stale successful history')
+check(guard.status(0)['tunnels'][0]['line_failures']==2,'exit-specific failed samples must override unrelated successful history')
 api=FakeClient.new([tunnel('observed')]); guard=engine(api,'observe'); ticks(guard,0,300)
 check(api.closed.empty? && !api.probed.empty?,'observe mode must probe but never close')
 

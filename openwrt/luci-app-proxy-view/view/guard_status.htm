@@ -300,18 +300,26 @@
   function render(data){
     (data.exits||[]).forEach(function(item){item.tunnels=(item.tunnels||[]).filter(function(tunnel){return !closedIds[tunnel.id]})});
     last=data;
+    var scrollPositions=Object.create(null);
+    root.querySelectorAll('[data-telemetry]').forEach(function(card){
+      scrollPositions[card.getAttribute('data-telemetry')]=card.querySelector('.pv-table-wrap').scrollLeft;
+    });
     var editing=dirty||saving||root.contains(document.activeElement);
     if(editing){
       root.querySelectorAll('[data-telemetry]').forEach(function(old){
         var item=(data.exits||[]).find(function(e){return e.id===old.getAttribute('data-telemetry')});
         if(item)old.parentNode.replaceChild(renderTelemetry(item),old);
       });
-      freshness();return;
+    }else{
+      var global=document.getElementById('pv-global');global.checked=Boolean(data.enabled);
+      root.innerHTML='';(data.exits||[]).forEach(function(item){root.appendChild(renderExit(item))});
+      if(!(data.exits||[]).length)root.appendChild(node('div','pv-card pv-empty','没有发现完整的 exit-node(<id>)、➡️ 代理隧道(<id>) 与订阅原生 ⚡ …出口｜多线加速。'));
     }
-    var global=document.getElementById('pv-global');global.checked=Boolean(data.enabled);
-    root.innerHTML='';(data.exits||[]).forEach(function(item){root.appendChild(renderExit(item))});
-    if(!(data.exits||[]).length)root.appendChild(node('div','pv-card pv-empty','没有发现完整的 exit-node(<id>)、➡️ 代理隧道(<id>) 与订阅原生 ⚡ …出口｜多线加速。'))
     freshness();
+    root.querySelectorAll('[data-telemetry]').forEach(function(card){
+      var position=scrollPositions[card.getAttribute('data-telemetry')];
+      if(position)card.querySelector('.pv-table-wrap').scrollLeft=position;
+    });
   }
   function load(){if(loading||document.hidden)return;loading=true;XHR.get(stateUrl,null,function(xhr,data){loading=false;if(data&&Array.isArray(data.exits)){receivedAt=Date.now();render(data)}else freshness()})}
   var globalTimer=null, globalInput=document.getElementById('pv-global');

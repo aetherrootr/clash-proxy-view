@@ -5,15 +5,29 @@ import vm from 'node:vm';
 
 // Exercise the actual LuCI renderers without network calls or live router actions.
 const view = readFileSync(new URL('../openwrt/luci-app-proxy-view/view/guard_status.htm', import.meta.url), 'utf8');
-const renderers = view.slice(view.indexOf('  function renderTelemetry('), view.indexOf('  function render(data)'));
+const renderers = view.slice(view.indexOf('  function renderTelemetry('), view.indexOf('  function load()'));
 const now = 1794415000000;
 class Element {
-  constructor(tag, cls, text) { this.tag = tag; this.className = cls; this.text = text ?? ''; this.children = []; this.attributes = {}; this.style = {}; }
-  appendChild(child) { this.children.push(child); return child; }
+  constructor(tag, cls, text) { this.tag = tag; this.className = cls; this.text = text ?? ''; this.children = []; this.attributes = {}; this.style = {}; this.scrollLeft = 0; }
+  appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
+  replaceChild(child, old) {
+    child.parentNode = this;
+    this.children[this.children.indexOf(old)] = child;
+    old.parentNode = null;
+  }
+  contains(element) { return all(this, (child) => child === element).length > 0; }
+  querySelectorAll(selector) {
+    const matches = selector.startsWith('.')
+      ? (child) => child.className?.split(' ').includes(selector.slice(1))
+      : (child) => child.getAttribute(selector.slice(1, -1)) !== undefined;
+    return this.children.flatMap((child) => all(child, matches));
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0]; }
   setAttribute(key, value) { this.attributes[key] = value; }
   getAttribute(key) { return this.attributes[key]; }
   get textContent() { return this.text + this.children.map((child) => child.textContent).join(' '); }
   set textContent(value) { this.text = value; this.children = []; }
+  set innerHTML(value) { this.textContent = value; }
 }
 function all(root, predicate) {
   return [...(predicate(root) ? [root] : []), ...root.children.flatMap((child) => all(child, predicate))];
@@ -37,11 +51,17 @@ function renderer() {
   const context = vm.createContext({
     node: (tag, cls, text) => new Element(tag, cls, text), bytes: (value) => `${value ?? 0} B`,
     Date: class extends Date { static now() { return now; } },
-    last: { running: true, enabled: true }, saving: false, requests: [], closedIds: {}, openEvidence: {},
+    root: new Element('div'), dirty: false, last: { running: true, enabled: true },
+    saving: false, requests: [], closedIds: {}, openEvidence: {}, freshness: () => {},
     confirm: () => true, post: (payload) => posts.push(payload),
     document: { getElementById: () => new Element('div') },
   });
   vm.runInContext(renderers, context);
+  context.renderExit = (item) => {
+    const card = new Element('section');
+    card.appendChild(context.renderTelemetry(item));
+    return card;
+  };
   return { context, posts };
 }
 
@@ -74,6 +94,34 @@ test('inactive candidate advice is retained separately and expanded evidence sur
   detail.ontoggle();
   const refreshed = context.renderTelemetry(fixture());
   assert.equal(all(refreshed, (element) => element.tag === 'details' && element.children[0]?.textContent === '查看依据')[0].open, true);
+});
+
+test('each connection table retains its horizontal position during full and editing refreshes', () => {
+  const { context } = renderer();
+  const jp = fixture();
+  const hk = { ...fixture(), id: 'hk' };
+  const data = { running: true, enabled: true, exits: [jp, hk] };
+  const tableWraps = () => context.root.querySelectorAll('.pv-table-wrap');
+
+  context.render(data);
+  const [jpWrap, hkWrap] = tableWraps();
+  jpWrap.scrollLeft = 120;
+  hkWrap.scrollLeft = 350;
+
+  data.exits.reverse();
+  context.render(data);
+  const [refreshedHk, refreshedJp] = tableWraps();
+  assert.notEqual(refreshedJp, jpWrap);
+  assert.notEqual(refreshedHk, hkWrap);
+  assert.deepEqual(tableWraps().map((wrap) => wrap.scrollLeft), [350, 120]);
+
+  refreshedJp.scrollLeft = 0;
+  context.dirty = true;
+  jp.tunnels[0].line = 'updated-fast';
+  context.render(data);
+  assert.notEqual(tableWraps()[1], refreshedJp);
+  assert.ok(tableWraps()[1].textContent.includes('updated-fast'));
+  assert.deepEqual(tableWraps().map((wrap) => wrap.scrollLeft), [350, 0]);
 });
 
 test('unknown, stale and disabled assessments do not display an actionable recommendation', () => {
